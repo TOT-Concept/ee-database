@@ -1,0 +1,115 @@
+# Builds ee-database binaries for all supported OS/arch combos, signs each with
+# cosign, and publishes a GitHub Release with the binaries + signatures
+# attached. Triggered by pushing a tag matching ee-database-v*.
+#
+# Required repo secrets:
+#   COSIGN_PRIVATE_KEY  — the cosign-generated PEM (as a single-line value)
+#   COSIGN_PASSWORD     — passphrase for the cosign key
+#
+# Outputs:
+#   ee-database-darwin-arm64        ee-database-darwin-arm64.sig
+#   ee-database-darwin-x86_64       ee-database-darwin-x86_64.sig
+#   ee-database-linux-arm64         ee-database-linux-arm64.sig
+#   ee-database-linux-x86_64        ee-database-linux-x86_64.sig
+#   ee-database-windows-x86_64.exe  ee-database-windows-x86_64.exe.sig
+
+name: Release
+
+on:
+  push:
+    tags: ["ee-database-v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # required for softprops/action-gh-release
+
+jobs:
+  build:
+    name: Build ${{ matrix.os }}/${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: darwin
+            arch: arm64
+            ext: ""
+          - os: darwin
+            arch: amd64
+            arch_label: x86_64
+            ext: ""
+          - os: linux
+            arch: arm64
+            ext: ""
+          - os: linux
+            arch: amd64
+            arch_label: x86_64
+            ext: ""
+          - os: windows
+            arch: amd64
+            arch_label: x86_64
+            ext: .exe
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache: true
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.os }}
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: "0"
+        run: |
+          ARCH_LABEL="${{ matrix.arch_label || matrix.arch }}"
+          OUT="ee-database-${{ matrix.os }}-${ARCH_LABEL}${{ matrix.ext }}"
+          go build -trimpath -ldflags="-s -w" -o "$OUT" .
+          ls -lh "$OUT"
+          echo "OUT=$OUT" >> "$GITHUB_ENV"
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign binary
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+        run: |
+          cosign sign-blob --yes \
+            --key env://COSIGN_PRIVATE_KEY \
+            --output-signature "${OUT}.sig" \
+            "${OUT}"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.OUT }}
+          path: |
+            ${{ env.OUT }}
+            ${{ env.OUT }}.sig
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          merge-multiple: true
+
+      - name: Show built artifacts
+        run: ls -lh dist/
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') }}

@@ -21,6 +21,13 @@ func tempRoot(t *testing.T) string {
 	return d
 }
 
+func must(t *testing.T, err error) {
+	t.Helper()
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestMigrateLegacyLayout(t *testing.T) {
 	root := tempRoot(t)
 	if err := os.MkdirAll(root, 0o700); err != nil {
@@ -28,9 +35,9 @@ func TestMigrateLegacyLayout(t *testing.T) {
 	}
 	legacy := Config{DatabaseID: "abc-123", DatabaseName: "prod", ServerURL: "https://x"}
 	raw, _ := json.Marshal(legacy)
-	os.WriteFile(filepath.Join(root, "config.json"), raw, 0o644)
-	os.WriteFile(filepath.Join(root, "token"), []byte("tok"), 0o600)
-	os.WriteFile(filepath.Join(root, "dsn"), []byte("postgres://x"), 0o600)
+	must(t, os.WriteFile(filepath.Join(root, "config.json"), raw, 0o644))
+	must(t, os.WriteFile(filepath.Join(root, "token"), []byte("tok"), 0o600))
+	must(t, os.WriteFile(filepath.Join(root, "dsn"), []byte("postgres://x"), 0o600))
 
 	profiles, err := ListProfiles()
 	if err != nil {
@@ -53,10 +60,10 @@ func TestMigrateLegacyLayout(t *testing.T) {
 
 func TestMigrateLegacyLayoutWithoutDatabaseID(t *testing.T) {
 	root := tempRoot(t)
-	os.MkdirAll(root, 0o700)
+	must(t, os.MkdirAll(root, 0o700))
 	raw, _ := json.Marshal(Config{ServerURL: "https://x"})
-	os.WriteFile(filepath.Join(root, "config.json"), raw, 0o644)
-	os.WriteFile(filepath.Join(root, "token"), []byte("tok"), 0o600)
+	must(t, os.WriteFile(filepath.Join(root, "config.json"), raw, 0o644))
+	must(t, os.WriteFile(filepath.Join(root, "token"), []byte("tok"), 0o600))
 
 	profiles, err := ListProfiles()
 	if err != nil {
@@ -96,8 +103,8 @@ func TestSaveLoadRenameClear(t *testing.T) {
 
 func TestRenameOntoExistingKeepsTarget(t *testing.T) {
 	tempRoot(t)
-	SaveProfile("legacy", &Config{ServerURL: "https://old"}, "old-tok")
-	SaveProfile("id-2", &Config{DatabaseID: "id-2", ServerURL: "https://new"}, "new-tok")
+	must(t, SaveProfile("legacy", &Config{ServerURL: "https://old"}, "old-tok"))
+	must(t, SaveProfile("id-2", &Config{DatabaseID: "id-2", ServerURL: "https://new"}, "new-tok"))
 	if err := RenameProfile("legacy", "id-2"); err != nil {
 		t.Fatal(err)
 	}

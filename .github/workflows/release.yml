@@ -1,17 +1,18 @@
 # Builds ee-database binaries for all supported OS/arch combos, signs each with
-# cosign, and publishes a GitHub Release with the binaries + signatures
+# Sigstore keyless cosign (GitHub OIDC identity, logged in the public Rekor
+# transparency log — no long-lived signing key or repo secret involved), and
+# publishes a GitHub Release with the binaries + signatures + certificates
 # attached. Triggered by pushing a tag matching ee-database-v*.
 #
-# Required repo secrets:
-#   COSIGN_PRIVATE_KEY  — the cosign-generated PEM (as a single-line value)
-#   COSIGN_PASSWORD     — passphrase for the cosign key
+# install.sh / install.ps1 verify each download against this workflow's
+# identity: release.yml@refs/tags/ee-database-v*.
 #
-# Outputs:
-#   ee-database-darwin-arm64        ee-database-darwin-arm64.sig
-#   ee-database-darwin-x86_64       ee-database-darwin-x86_64.sig
-#   ee-database-linux-arm64         ee-database-linux-arm64.sig
-#   ee-database-linux-x86_64        ee-database-linux-x86_64.sig
-#   ee-database-windows-x86_64.exe  ee-database-windows-x86_64.exe.sig
+# Outputs (per platform): <asset>  <asset>.sig  <asset>.pem
+#   ee-database-darwin-arm64
+#   ee-database-darwin-x86_64
+#   ee-database-linux-arm64
+#   ee-database-linux-x86_64
+#   ee-database-windows-x86_64.exe
 
 name: Release
 
@@ -27,6 +28,9 @@ jobs:
   build:
     name: Build ${{ matrix.os }}/${{ matrix.arch }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write   # mint the GitHub OIDC token for Sigstore keyless signing
     strategy:
       fail-fast: false
       matrix:
@@ -72,14 +76,11 @@ jobs:
       - name: Install cosign
         uses: sigstore/cosign-installer@v3
 
-      - name: Sign binary
-        env:
-          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
-          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+      - name: Sign binary (Sigstore keyless)
         run: |
           cosign sign-blob --yes \
-            --key env://COSIGN_PRIVATE_KEY \
             --output-signature "${OUT}.sig" \
+            --output-certificate "${OUT}.pem" \
             "${OUT}"
 
       - name: Upload artifacts
@@ -89,6 +90,7 @@ jobs:
           path: |
             ${{ env.OUT }}
             ${{ env.OUT }}.sig
+            ${{ env.OUT }}.pem
 
   release:
     name: Publish GitHub Release

@@ -11,6 +11,8 @@ set -euo pipefail
 #
 #  This installer is also open source. Audit it before running:
 #    curl -fsSL https://entityenricher.ai/install-eedatabase.sh | less
+#  (that URL is an alias of the canonical script in the repo:
+#    https://raw.githubusercontent.com/TOT-Concept/ee-database/main/install.sh)
 # ──────────────────────────────────────────────────────────────────
 
 REPO="TOT-Concept/ee-database"
@@ -32,13 +34,19 @@ ASSET="ee-database-${OS}-${ARCH}"
 if [ "$VERSION" = "latest" ]; then
   URL="https://github.com/${REPO}/releases/latest/download/${ASSET}"
   SIG_URL="https://github.com/${REPO}/releases/latest/download/${ASSET}.sig"
+  CERT_URL="https://github.com/${REPO}/releases/latest/download/${ASSET}.pem"
 else
   URL="https://github.com/${REPO}/releases/download/${VERSION}/${ASSET}"
   SIG_URL="https://github.com/${REPO}/releases/download/${VERSION}/${ASSET}.sig"
+  CERT_URL="https://github.com/${REPO}/releases/download/${VERSION}/${ASSET}.pem"
 fi
 
-# cosign public key used to verify release-signed binaries.
-COSIGN_PUBKEY_URL="${EE_DATABASE_COSIGN_PUBKEY_URL:-https://entityenricher.ai/ee-database-cosign.pub}"
+# Sigstore keyless verification: releases are signed in CI by the release
+# workflow's GitHub OIDC identity and logged in the public Rekor transparency
+# log. There is no long-lived signing key anywhere — verification pins the
+# exact workflow identity below.
+CERT_IDENTITY_REGEXP="^https://github\.com/TOT-Concept/ee-database/\.github/workflows/release\.yml@refs/tags/ee-database-v"
+CERT_OIDC_ISSUER="https://token.actions.githubusercontent.com"
 
 if [ -w /usr/local/bin ]; then
   DEST="/usr/local/bin/ee-database"
@@ -55,7 +63,8 @@ ee-database installer
 
   Source     https://github.com/${REPO}  (MIT)
   Download   ${URL}
-  Signature  cosign-verified against ${COSIGN_PUBKEY_URL}
+  Signature  Sigstore keyless (cosign) — signed by the release workflow's
+             GitHub OIDC identity, logged in the public Rekor transparency log
   Install to ${DEST}
   Version    ${VERSION}
 
@@ -82,8 +91,8 @@ mkdir -p "$(dirname "$DEST")"
 
 TMP=$(mktemp)
 TMP_SIG=$(mktemp)
-TMP_PUB=$(mktemp)
-trap 'rm -f "$TMP" "$TMP_SIG" "$TMP_PUB"' EXIT
+TMP_CERT=$(mktemp)
+trap 'rm -f "$TMP" "$TMP_SIG" "$TMP_CERT"' EXIT
 
 if ! curl -fsSL "$URL" -o "$TMP"; then
   echo "Download failed from $URL" >&2
@@ -91,10 +100,12 @@ if ! curl -fsSL "$URL" -o "$TMP"; then
   exit 1
 fi
 
-# === Signature verification =================================================
-# We download the binary's .sig + the project's cosign public key, then verify.
-# Skipped only when the user opts out via EE_DATABASE_SKIP_VERIFY=1, in which
-# case we print a loud warning so it's never silent.
+# === Signature verification (Sigstore keyless) ==============================
+# We download the binary's .sig + the release workflow's Fulcio certificate,
+# then verify that the signature was produced by this repo's release.yml
+# running on a release tag, with the entry logged in Rekor. Skipped only when
+# the user opts out via EE_DATABASE_SKIP_VERIFY=1, in which case we print a
+# loud warning so it's never silent.
 if [ -z "${EE_DATABASE_SKIP_VERIFY:-}" ]; then
   if ! command -v cosign >/dev/null 2>&1; then
     echo "cosign is required to verify the binary signature." >&2
@@ -109,17 +120,22 @@ if [ -z "${EE_DATABASE_SKIP_VERIFY:-}" ]; then
     echo "  Bypass:   EE_DATABASE_SKIP_VERIFY=1 (not recommended)" >&2
     exit 1
   fi
-  if ! curl -fsSL "$COSIGN_PUBKEY_URL" -o "$TMP_PUB"; then
-    echo "Could not download cosign public key from $COSIGN_PUBKEY_URL" >&2
+  if ! curl -fsSL "$CERT_URL" -o "$TMP_CERT"; then
+    echo "Could not download signing certificate from $CERT_URL" >&2
+    echo "  Bypass:   EE_DATABASE_SKIP_VERIFY=1 (not recommended)" >&2
     exit 1
   fi
-  if ! cosign verify-blob --key "$TMP_PUB" --signature "$TMP_SIG" "$TMP" >/dev/null 2>&1; then
+  if ! cosign verify-blob \
+      --certificate "$TMP_CERT" \
+      --certificate-identity-regexp "$CERT_IDENTITY_REGEXP" \
+      --certificate-oidc-issuer "$CERT_OIDC_ISSUER" \
+      --signature "$TMP_SIG" "$TMP" >/dev/null 2>&1; then
     echo "✗ Signature verification FAILED for $ASSET" >&2
-    echo "  The downloaded binary does not match the published signature." >&2
-    echo "  This could mean tampering or a partial download. Aborting." >&2
+    echo "  The downloaded binary was not signed by the ee-database release" >&2
+    echo "  workflow (or the download is partial/tampered). Aborting." >&2
     exit 1
   fi
-  echo "✓ Signature verified."
+  echo "✓ Signature verified (Sigstore keyless, Rekor-logged)."
 else
   echo "⚠  EE_DATABASE_SKIP_VERIFY=1 set — proceeding without signature check." >&2
 fi
@@ -127,7 +143,7 @@ fi
 chmod +x "$TMP"
 mv "$TMP" "$DEST"
 trap - EXIT
-rm -f "$TMP_SIG" "$TMP_PUB"
+rm -f "$TMP_SIG" "$TMP_CERT"
 
 echo "✓ Installed ee-database to $DEST"
 

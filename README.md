@@ -28,7 +28,22 @@ Entity Enricher ──WSS──▶ ee-database ──SQL──▶ your PostgreSQ
 
 ## Install
 
-Download a signed binary from [Releases](https://github.com/TOT-Concept/ee-database/releases),
+```sh
+curl -fsSL https://entityenricher.ai/install-eedatabase.sh | sh
+```
+
+(Windows: `iwr -useb https://entityenricher.ai/install-eedatabase.ps1 | iex`.
+Both URLs are 302 aliases of [`install.sh`](install.sh) /
+[`install.ps1`](install.ps1) at the root of this repo.)
+
+The installer prints what it's about to do, pauses 5 seconds, and verifies the
+binary's **Sigstore keyless signature** before making it executable: releases
+are signed in CI by this repo's `release.yml` GitHub OIDC identity and logged
+in the public [Rekor](https://search.sigstore.dev) transparency log — there is
+no long-lived signing key anywhere.
+
+Alternatively, download a signed binary from
+[Releases](https://github.com/TOT-Concept/ee-database/releases) yourself,
 or build from source (Go ≥ 1.23):
 
 ```bash

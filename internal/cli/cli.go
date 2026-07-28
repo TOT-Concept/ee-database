@@ -39,7 +39,7 @@ import (
 	eesync "github.com/TOT-Concept/ee-database/internal/sync"
 )
 
-const Version = "0.3.0"
+const Version = "1.0.1"
 
 // Run dispatches to the appropriate subcommand. Returns the process exit code.
 func Run(args []string, stdout, stderr io.Writer) int {
@@ -349,7 +349,11 @@ func persistPairing(
 		fmt.Fprintf(stdout, "  Database: %s (%s)\n", databaseName, dialect)
 	}
 	fmt.Fprintf(stdout, "  Credentials stored in %s\n", dir)
-	fmt.Fprintf(stdout, "  Run 'ee-database run --dsn <your-dsn>' to start syncing.\n")
+	runHint := "ee-database run --dsn <your-dsn>"
+	if databaseID != "" {
+		runHint = "ee-database run --database " + databaseID + " --dsn <your-dsn>"
+	}
+	fmt.Fprintf(stdout, "  Run '%s' to start syncing.\n", runHint)
 	return 0
 }
 

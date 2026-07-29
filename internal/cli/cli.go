@@ -39,7 +39,7 @@ import (
 	eesync "github.com/TOT-Concept/ee-database/internal/sync"
 )
 
-const Version = "1.0.1"
+const Version = "1.1.0"
 
 // Run dispatches to the appropriate subcommand. Returns the process exit code.
 func Run(args []string, stdout, stderr io.Writer) int {

@@ -673,7 +673,14 @@ func connectAndPump(
 	defer conn.Close(websocket.StatusNormalClosure, "client exit")
 	logger.Printf("connected ✓ waiting for deltas")
 
-	return true, eesync.Pump(ctx, conn, db, logger)
+	// The server pauses the feed with snapshot_required after a schema is
+	// re-linked (publish model) — the snapshot is the only carrier of rows
+	// written while it was unlinked. Re-applying converges: idempotent DDL +
+	// ADD COLUMN convergence + revision-guarded upserts.
+	rebootstrap := func(rctx context.Context) error {
+		return eesync.Bootstrap(rctx, authClient, access.AccessToken, db, logger)
+	}
+	return true, eesync.Pump(ctx, conn, db, logger, rebootstrap)
 }
 
 // healProfile completes a profile whose pairing predates database metadata

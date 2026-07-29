@@ -47,6 +47,11 @@ type Batch struct {
 	Type    string  `json:"type"` // "batch"
 	Deltas  []Delta `json:"deltas"`
 	HasMore bool    `json:"has_more"`
+	// SnapshotRequired pauses the feed: the server withholds deltas until the
+	// replica re-applies the .sql snapshot (rows written while a schema was
+	// unlinked exist only there). The batch is empty when set; re-bootstrap,
+	// then delivery resumes. Absent on older servers (zero value = false).
+	SnapshotRequired bool `json:"snapshot_required"`
 }
 
 type Pong struct {

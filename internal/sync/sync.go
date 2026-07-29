@@ -85,7 +85,11 @@ func (c *Conn) Close(code websocket.StatusCode, reason string) {
 
 // Pump receives batches and applies them until the connection drops or an
 // apply error halts the client. Returns nil only on context cancellation.
-func Pump(ctx context.Context, conn *Conn, db *sql.DB, logger *log.Logger) error {
+// rebootstrap re-applies the snapshot when the server pauses the feed with
+// snapshot_required (publish model: rows written while a schema was unlinked
+// exist only in the snapshot); nil logs and waits instead.
+func Pump(ctx context.Context, conn *Conn, db *sql.DB, logger *log.Logger,
+	rebootstrap func(context.Context) error) error {
 	// Keepalive: drives intermediate proxies; the server answers pong frames.
 	pingCtx, pingCancel := context.WithCancel(ctx)
 	defer pingCancel()
@@ -112,6 +116,17 @@ func Pump(ctx context.Context, conn *Conn, db *sql.DB, logger *log.Logger) error
 		}
 		switch f := frame.(type) {
 		case framing.Batch:
+			if f.SnapshotRequired {
+				if rebootstrap == nil {
+					logger.Printf("server paused the feed: re-run 'ee-database run' to re-apply the snapshot")
+					continue
+				}
+				logger.Printf("server paused the feed: re-applying the snapshot…")
+				if err := rebootstrap(ctx); err != nil {
+					return fmt.Errorf("re-bootstrap: %w", err)
+				}
+				continue
+			}
 			if len(f.Deltas) == 0 {
 				continue
 			}

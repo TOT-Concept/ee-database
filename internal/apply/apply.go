@@ -12,6 +12,7 @@ package apply
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"fmt"
 
 	gomysql "github.com/go-sql-driver/mysql"
@@ -54,9 +55,24 @@ func Open(dialect, dsn string) (*sql.DB, error) {
 // Snapshot applies the bootstrap .sql script. The script carries its own
 // BEGIN/COMMIT, and every statement is idempotent (CREATE IF NOT EXISTS +
 // revision-guarded upserts), so applying it onto a non-empty replica converges.
+//
+// It runs on a dedicated connection that is discarded on failure: a failed
+// multi-statement script can leave the session inside an aborted transaction
+// (pgx < v5.8 pooled such connections, so every retry reported SQLSTATE 25P02
+// instead of the root cause), and no dialect is trusted to clean that up.
 func Snapshot(ctx context.Context, db *sql.DB, sqlText string) error {
-	_, err := db.ExecContext(ctx, sqlText)
-	return err
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	_, execErr := conn.ExecContext(ctx, sqlText)
+	if execErr != nil {
+		_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+	}
+	if closeErr := conn.Close(); execErr == nil {
+		return closeErr
+	}
+	return execErr
 }
 
 // Batch applies deltas in id order inside one transaction.

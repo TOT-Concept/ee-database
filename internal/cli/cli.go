@@ -39,7 +39,9 @@ import (
 	eesync "github.com/TOT-Concept/ee-database/internal/sync"
 )
 
-const Version = "1.1.0"
+// Version aliases the sync package's release version (single source, so the
+// hello-frame agent string can never drift from the CLI banner again).
+const Version = eesync.Version
 
 // Run dispatches to the appropriate subcommand. Returns the process exit code.
 func Run(args []string, stdout, stderr io.Writer) int {
@@ -594,6 +596,16 @@ func cmdRun(args []string, stdout, stderr io.Writer, logger *log.Logger) int {
 	return 0
 }
 
+// failedSnapshotPath resolves the profile-local dump written when a snapshot
+// fails to apply; "" (no dump) when the profile directory cannot be resolved.
+func failedSnapshotPath(key string) string {
+	p, err := config.FailedSnapshotPath(key)
+	if err != nil {
+		return ""
+	}
+	return p
+}
+
 func targetLabel(t *target) string {
 	if t.cfg.DatabaseName != "" {
 		return t.cfg.DatabaseName
@@ -657,7 +669,8 @@ func connectAndPump(
 
 	// First run: seed the replica from the snapshot before consuming deltas.
 	if !t.cfg.Bootstrapped {
-		if err := eesync.Bootstrap(ctx, authClient, access.AccessToken, db, logger); err != nil {
+		if err := eesync.Bootstrap(ctx, authClient, access.AccessToken, db, logger,
+			failedSnapshotPath(t.key)); err != nil {
 			return false, fmt.Errorf("bootstrap: %w", err)
 		}
 		t.cfg.Bootstrapped = true
@@ -678,7 +691,8 @@ func connectAndPump(
 	// written while it was unlinked. Re-applying converges: idempotent DDL +
 	// ADD COLUMN convergence + revision-guarded upserts.
 	rebootstrap := func(rctx context.Context) error {
-		return eesync.Bootstrap(rctx, authClient, access.AccessToken, db, logger)
+		return eesync.Bootstrap(rctx, authClient, access.AccessToken, db, logger,
+			failedSnapshotPath(t.key))
 	}
 	return true, eesync.Pump(ctx, conn, db, logger, rebootstrap)
 }

@@ -138,6 +138,17 @@ The target dialect is fixed by the schema database registration in Entity
 Enricher. PostgreSQL is the launch dialect; the MySQL and SQLite drivers are
 already bundled for when their SQL renderers ship.
 
+## Troubleshooting a failed apply
+
+When the target database rejects the snapshot or a delta, ee-database prints
+everything the database reported — SQLSTATE, detail, hint, and (when the
+server provides an error cursor) the offending script line. A failed snapshot
+is additionally saved to the pairing's profile directory as
+`snapshot-failed.sql` (mode 0600, replaced on each attempt, removed on the
+next success), so the failing statement can be inspected or replayed with
+`psql -f`. Nothing is partially applied: the snapshot is one transaction, and
+a failed delta batch rolls back and is redelivered once the cause is fixed.
+
 ## Security model
 
 - One credential = one schema database = one client. Pairing again rotates the

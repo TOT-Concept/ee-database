@@ -1,11 +1,11 @@
 module github.com/TOT-Concept/ee-database
 
-go 1.23.0
+go 1.25.0
 
 require (
 	github.com/coder/websocket v1.8.13
 	github.com/go-sql-driver/mysql v1.9.3
-	github.com/jackc/pgx/v5 v5.7.5
+	github.com/jackc/pgx/v5 v5.10.0
 	github.com/mattn/go-isatty v0.0.20
 	golang.org/x/sys v0.33.0
 	modernc.org/sqlite v1.38.0
@@ -20,10 +20,9 @@ require (
 	github.com/jackc/puddle/v2 v2.2.2 // indirect
 	github.com/ncruces/go-strftime v0.1.9 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
-	golang.org/x/crypto v0.37.0 // indirect
 	golang.org/x/exp v0.0.0-20250408133849-7e4ce0ab07d0 // indirect
-	golang.org/x/sync v0.14.0 // indirect
-	golang.org/x/text v0.24.0 // indirect
+	golang.org/x/sync v0.17.0 // indirect
+	golang.org/x/text v0.29.0 // indirect
 	modernc.org/libc v1.65.10 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect

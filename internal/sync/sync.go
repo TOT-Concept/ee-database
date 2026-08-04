@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/coder/websocket"
@@ -25,8 +26,12 @@ const (
 	maxReadBytes = 64 * 1024 * 1024
 )
 
+// Version is the CLI release version — single source for the version command,
+// run banners and the wire agent identity below.
+const Version = "1.2.0"
+
 // Agent identifies this client in User-Agent and hello frames.
-const Agent = "ee-database/0.1.0"
+const Agent = "ee-database/" + Version
 
 // PermanentError stops the reconnect loop (revoked credential, apply failure).
 type PermanentError struct{ Inner error }
@@ -135,6 +140,15 @@ func Pump(ctx context.Context, conn *Conn, db *sql.DB, logger *log.Logger,
 			lastID, failedID, err := apply.Batch(ctx, db, f.Deltas)
 			if err != nil {
 				msg := err.Error()
+				if failedID != nil {
+					for i := range f.Deltas {
+						if f.Deltas[i].ID == *failedID {
+							msg = apply.DescribeError(f.Deltas[i].SQL, err)
+							break
+						}
+					}
+				}
+				logger.Printf("delta apply failed:\n%s", msg)
 				_ = conn.Send(ctx, framing.ApplyError{
 					Type: "apply_error", DeltaID: failedID, Message: msg,
 				})
@@ -156,15 +170,33 @@ func Pump(ctx context.Context, conn *Conn, db *sql.DB, logger *log.Logger,
 	}
 }
 
-// Bootstrap fetches and applies the snapshot over the credential.
-func Bootstrap(ctx context.Context, client *auth.Client, accessToken string, db *sql.DB, logger *log.Logger) error {
+// Bootstrap fetches and applies the snapshot over the credential. On apply
+// failure the database's full complaint is logged and the fetched script is
+// saved to failDump (when non-empty) so the failing statement can be
+// inspected; a later success removes the stale dump.
+func Bootstrap(ctx context.Context, client *auth.Client, accessToken string, db *sql.DB,
+	logger *log.Logger, failDump string) error {
 	logger.Printf("bootstrapping: fetching snapshot…")
 	sqlText, cursor, err := client.FetchSnapshot(ctx, accessToken)
 	if err != nil {
 		return err
 	}
 	if err := apply.Snapshot(ctx, db, sqlText); err != nil {
+		logger.Printf("snapshot apply failed (nothing applied — single transaction):\n%s",
+			apply.DescribeError(sqlText, err))
+		if failDump != "" {
+			// The script only exists in this response — persist it (0600: it
+			// carries the org's entity data) or the error is undiagnosable.
+			if werr := os.WriteFile(failDump, []byte(sqlText), 0o600); werr != nil {
+				logger.Printf("could not save the failed snapshot: %v", werr)
+			} else {
+				logger.Printf("failed snapshot saved to %s", failDump)
+			}
+		}
 		return fmt.Errorf("apply snapshot: %w", err)
+	}
+	if failDump != "" {
+		_ = os.Remove(failDump) // evidence from an earlier failed attempt
 	}
 	logger.Printf("bootstrap complete (delta cursor %d)", cursor)
 	return nil

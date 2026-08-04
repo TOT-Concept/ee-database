@@ -5,9 +5,11 @@
 // Windows %APPDATA%\ee-database):
 //
 //	<root>/profiles/<database-id>/config.json
-//	<root>/profiles/<database-id>/token  (mode 0600)
-//	<root>/profiles/<database-id>/dsn    (mode 0600, optional --save-dsn)
-//	<root>/profiles/<database-id>/lock   (flock guard, one runner per profile)
+//	<root>/profiles/<database-id>/token                (mode 0600)
+//	<root>/profiles/<database-id>/dsn                  (mode 0600, optional --save-dsn)
+//	<root>/profiles/<database-id>/lock                 (flock guard, one runner per profile)
+//	<root>/profiles/<database-id>/snapshot-failed.sql  (mode 0600, last snapshot that
+//	                                                    failed to apply; removed on success)
 //
 // The pre-0.2.0 single-pairing layout (<root>/{config.json,token,dsn}) is
 // migrated into a profile automatically on first access. A profile paired from
@@ -26,11 +28,12 @@ import (
 )
 
 const (
-	configFileName = "config.json"
-	tokenFileName  = "token"
-	dsnFileName    = "dsn"
-	dirPerm        = 0o700
-	secretPerm     = 0o600
+	configFileName         = "config.json"
+	tokenFileName          = "token"
+	dsnFileName            = "dsn"
+	failedSnapshotFileName = "snapshot-failed.sql"
+	dirPerm                = 0o700
+	secretPerm             = 0o600
 
 	// LegacyKey is the profile key used when the paired database's id is
 	// unknown (old server, pre-migration state). Healed on first run.
@@ -91,6 +94,16 @@ func ProfileDir(key string) (string, error) {
 		return "", err
 	}
 	return filepath.Join(d, "profiles", key), nil
+}
+
+// FailedSnapshotPath names the profile-local dump of the last snapshot that
+// failed to apply — written by the run loop, removed on the next success.
+func FailedSnapshotPath(key string) (string, error) {
+	p, err := ProfileDir(key)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(p, failedSnapshotFileName), nil
 }
 
 // validateKey rejects keys that could escape the profiles directory.

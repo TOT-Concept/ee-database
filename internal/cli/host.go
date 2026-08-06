@@ -83,7 +83,8 @@ Pair flags:
                      (sqlite: --dsn is a directory; databases become files in it).
   --skip-preflight   Pair even when the provisioning-rights check fails.
 
-The token comes from the Database Sync page (Sync hosts → Add host) — shown once.
+The token comes from the Sync hosts dialog (Database Sync page → "Sync hosts"
+toolbar button) → Add host — and is shown once.
 `)
 }
 

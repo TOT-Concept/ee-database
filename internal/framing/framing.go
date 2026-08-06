@@ -32,6 +32,26 @@ type Ping struct {
 	Type string `json:"type"` // "ping"
 }
 
+// PreflightReport is the client's privilege self-check on its target database,
+// sent after hello so the Sync client card can show provisioning gaps (a
+// missing CREATEDB, a revoked DDL right) before the user publishes and waits
+// for a delta that would never apply. Nil booleans mean "not determinable" on
+// that dialect; the server stamps the receive time.
+type PreflightReport struct {
+	Dialect  string   `json:"dialect"`
+	Database string   `json:"database,omitempty"`
+	User     string   `json:"user,omitempty"`
+	CreateDB *bool    `json:"create_db"`
+	DDL      *bool    `json:"ddl"`
+	DML      *bool    `json:"dml"`
+	Details  []string `json:"details,omitempty"`
+}
+
+type Preflight struct {
+	Type   string          `json:"type"` // "preflight"
+	Report PreflightReport `json:"report"`
+}
+
 // === server → client ========================================================
 
 type Delta struct {

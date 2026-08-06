@@ -28,7 +28,7 @@ const (
 
 // Version is the CLI release version — single source for the version command,
 // run banners and the wire agent identity below.
-const Version = "1.2.0"
+const Version = "1.4.0"
 
 // Agent identifies this client in User-Agent and hello frames.
 const Agent = "ee-database/" + Version
@@ -68,6 +68,37 @@ func Dial(ctx context.Context, wsURL, accessToken string) (*Conn, error) {
 	return c, nil
 }
 
+// DialHost opens the authenticated control-plane connection (managed mode)
+// and sends the host hello carrying the base DSN's dialect.
+func DialHost(ctx context.Context, wsURL, accessToken, dialect string) (*Conn, error) {
+	header := http.Header{}
+	header.Set("Authorization", "Bearer "+accessToken)
+	header.Set("User-Agent", Agent)
+	ws, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{HTTPHeader: header})
+	if err != nil {
+		return nil, fmt.Errorf("dial host: %w", err)
+	}
+	ws.SetReadLimit(maxReadBytes)
+	c := &Conn{ws: ws}
+	hello := framing.HostHello{
+		Type: "hello", Version: framing.ProtocolVersion, Agent: Agent, Dialect: dialect,
+	}
+	if err := c.Send(ctx, hello); err != nil {
+		_ = ws.Close(websocket.StatusInternalError, "hello failed")
+		return nil, err
+	}
+	return c, nil
+}
+
+// RecvHost reads one control-plane frame (host protocol decoder).
+func (c *Conn) RecvHost(ctx context.Context) (any, error) {
+	_, raw, err := c.ws.Read(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return framing.DecodeHost(raw)
+}
+
 func (c *Conn) Send(ctx context.Context, frame any) error {
 	raw, err := json.Marshal(frame)
 	if err != nil {
@@ -93,8 +124,14 @@ func (c *Conn) Close(code websocket.StatusCode, reason string) {
 // rebootstrap re-applies the snapshot when the server pauses the feed with
 // snapshot_required (publish model: rows written while a schema was unlinked
 // exist only in the snapshot); nil logs and waits instead.
+//
+// bootstrapPending defers a first bootstrap that answered publish_required:
+// the client idles connected, and the first push (the publish queues the
+// bootstrap DDL delta) triggers the snapshot before any delta is applied —
+// replay-safe either way, since the snapshot and the queued deltas carry the
+// same revision-guarded statements.
 func Pump(ctx context.Context, conn *Conn, db *sql.DB, logger *log.Logger,
-	rebootstrap func(context.Context) error) error {
+	rebootstrap func(context.Context) error, bootstrapPending bool) error {
 	// Keepalive: drives intermediate proxies; the server answers pong frames.
 	pingCtx, pingCancel := context.WithCancel(ctx)
 	defer pingCancel()
@@ -121,16 +158,28 @@ func Pump(ctx context.Context, conn *Conn, db *sql.DB, logger *log.Logger,
 		}
 		switch f := frame.(type) {
 		case framing.Batch:
-			if f.SnapshotRequired {
+			if f.SnapshotRequired || bootstrapPending {
 				if rebootstrap == nil {
 					logger.Printf("server paused the feed: re-run 'ee-database run' to re-apply the snapshot")
 					continue
 				}
-				logger.Printf("server paused the feed: re-applying the snapshot…")
+				if bootstrapPending {
+					logger.Printf("first publish landed: bootstrapping from the snapshot…")
+				} else {
+					logger.Printf("server paused the feed: re-applying the snapshot…")
+				}
 				if err := rebootstrap(ctx); err != nil {
+					if errors.Is(err, auth.ErrPublishRequired) {
+						// A push raced the publish state — keep idling.
+						logger.Printf("still waiting for the first schema publish…")
+						continue
+					}
 					return fmt.Errorf("re-bootstrap: %w", err)
 				}
-				continue
+				bootstrapPending = false
+				if f.SnapshotRequired {
+					continue
+				}
 			}
 			if len(f.Deltas) == 0 {
 				continue

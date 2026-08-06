@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -13,6 +14,13 @@ import (
 	"strings"
 	"time"
 )
+
+// ErrPublishRequired marks the snapshot 409 sent while the database has linked
+// schemas but none published yet: nothing can reach the replica until the first
+// publish, so the caller should idle on the WebSocket (the server pushes the
+// bootstrap DDL delta when the publish lands) instead of treating it as a
+// failure and polling.
+var ErrPublishRequired = errors.New("no linked schema is published yet")
 
 // Client talks to /api/database-sync/* endpoints on the Entity Enricher server.
 type Client struct {
@@ -105,6 +113,9 @@ func (c *Client) FetchSnapshot(ctx context.Context, accessToken string) (string,
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode == http.StatusConflict && bytes.Contains(body, []byte("publish_required")) {
+			return "", 0, fmt.Errorf("snapshot: %w", ErrPublishRequired)
+		}
 		return "", 0, fmt.Errorf("snapshot: server returned %d: %s",
 			resp.StatusCode, strings.TrimSpace(string(body)))
 	}

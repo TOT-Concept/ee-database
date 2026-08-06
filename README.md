@@ -92,6 +92,16 @@ ee-database run \
 
 The admin DSN is used only for this bootstrap — it is never stored.
 
+On every run the client self-checks its login's provisioning rights — create
+database (from the catalog), DDL and DML (a create/insert/delete/drop probe
+table) — prints the result and reports it to the Databases page's Sync client
+card, so a missing grant is visible there before deltas fail to apply. The
+check is advisory: it never blocks the run.
+
+If none of the database's linked schemas is published yet, the first run has
+nothing to bootstrap: the client stays connected and waits, and the first
+publish starts the feed on its own — no restart needed.
+
 ## Commands
 
 | Command | Purpose |
@@ -102,9 +112,26 @@ The admin DSN is used only for this bootstrap — it is never stored.
 | `run … --create-missing` | Create the target database first when it does not exist (postgres/mysql; sqlite files are created anyway) |
 | `run … --create-missing --admin-dsn DSN` | Also create the target DSN's missing role/user via an admin connection (never stored) |
 | `run --all` | Sync every paired database concurrently (each needs a saved DSN) |
+| `host pair --server URL --dsn BASE_DSN [--admin-dsn DSN] <token>` | Pair this machine as a managed sync host (token from the Database Sync page's Sync hosts card) |
+| `host run` | Managed mode: auto-claim, create and sync every database sync assigned to this host |
+| `host status` / `host disconnect` | Show / forget the host pairing |
 | `status` | Show pairing state (all paired databases) |
 | `disconnect` | Forget one pairing's local credentials (revoke server-side in the UI) |
 | `version` | Print version |
+
+## Managed host mode
+
+Pairing is per database; managed mode moves the ceremony one level up. Pair the
+machine once — `--dsn` is a **base server DSN with no database name** (it never
+leaves the machine) — then `host run` holds one control-plane WebSocket and
+reacts to assignments made in the Entity Enricher UI (or API): it claims the
+credential, derives the database's DSN from the base DSN plus the
+server-suggested snake_cased name (override per registration via
+`database_names` in the host `config.json`), creates the database if missing,
+runs the rights preflight, and starts the ordinary sync loop. A database
+already paired with another client is reported and skipped — never hijacked.
+Revoking the host in the UI cuts the machine off entirely, including every
+credential it claimed.
 
 ## Multiple databases
 

@@ -36,6 +36,7 @@ import (
 	"github.com/TOT-Concept/ee-database/internal/apply"
 	"github.com/TOT-Concept/ee-database/internal/auth"
 	"github.com/TOT-Concept/ee-database/internal/config"
+	"github.com/TOT-Concept/ee-database/internal/framing"
 	eesync "github.com/TOT-Concept/ee-database/internal/sync"
 )
 
@@ -58,6 +59,8 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		return cmdPair(rest, stdout, stderr)
 	case "run":
 		return cmdRun(rest, stdout, stderr, logger)
+	case "host":
+		return cmdHost(rest, stdout, stderr, logger)
 	case "status":
 		return cmdStatus(rest, stdout, stderr)
 	case "disconnect":
@@ -91,6 +94,10 @@ Usage:
   ee-database pair --server URL <refresh-token>  Pair with a token from the Databases page
   ee-database run --dsn DSN                      Connect and apply deltas (default)
   ee-database run --all                          Sync every paired database (saved DSNs)
+  ee-database host pair --server URL --dsn DSN <token>
+                                                 Pair this machine as a managed sync host
+  ee-database host run                           Auto-claim, provision and sync every
+                                                 database sync assigned to this host
   ee-database status                             Show pairing state (all profiles)
   ee-database disconnect                         Forget one pairing's local credentials
   ee-database version                            Print version
@@ -431,10 +438,11 @@ func cmdDisconnect(args []string, stdout, stderr io.Writer) int {
 // target is one profile scheduled for syncing. key mutates when a legacy
 // profile self-heals to its real database id.
 type target struct {
-	key     string
-	cfg     *config.Config
-	refresh string
-	dsn     string
+	key       string
+	cfg       *config.Config
+	refresh   string
+	dsn       string
+	preflight framing.PreflightReport
 }
 
 // cmdRun runs the apply loop(s) until interrupted.
@@ -563,6 +571,12 @@ func cmdRun(args []string, stdout, stderr io.Writer, logger *log.Logger) int {
 			fmt.Fprintf(stderr, "run: %s: cannot reach the target database: %v\n", targetLabel(t), err)
 			return 1
 		}
+		// Provisioning-rights self-check: printed here, reported to the server
+		// on every connect so the Sync client card shows gaps before a publish
+		// queues deltas that could never apply. Advisory — a missing right
+		// doesn't stop the run; the apply path still surfaces real failures.
+		t.preflight = apply.Preflight(ctx, t.cfg.Dialect, t.dsn, db)
+		fmt.Fprintf(stdout, "Preflight %s: %s\n", targetLabel(t), preflightSummary(t.preflight))
 		dbs[i] = db
 	}
 
@@ -667,15 +681,39 @@ func connectAndPump(
 	}
 	healProfile(t, access, logger)
 
-	// First run: seed the replica from the snapshot before consuming deltas.
-	if !t.cfg.Bootstrapped {
-		if err := eesync.Bootstrap(ctx, authClient, access.AccessToken, db, logger,
+	// One closure serves the first bootstrap, the publish_required deferral and
+	// the snapshot_required re-bootstrap (the snapshot is the only carrier of
+	// rows written while a schema was unlinked). Re-applying converges:
+	// idempotent DDL + ADD COLUMN convergence + revision-guarded upserts.
+	bootstrap := func(rctx context.Context) error {
+		if err := eesync.Bootstrap(rctx, authClient, access.AccessToken, db, logger,
 			failedSnapshotPath(t.key)); err != nil {
-			return false, fmt.Errorf("bootstrap: %w", err)
+			return err
 		}
-		t.cfg.Bootstrapped = true
-		if err := config.SaveProfileConfig(t.key, t.cfg); err != nil {
-			logger.Printf("warning: could not persist bootstrap flag: %v", err)
+		if !t.cfg.Bootstrapped {
+			t.cfg.Bootstrapped = true
+			if err := config.SaveProfileConfig(t.key, t.cfg); err != nil {
+				logger.Printf("warning: could not persist bootstrap flag: %v", err)
+			}
+		}
+		return nil
+	}
+
+	// First run: seed the replica from the snapshot before consuming deltas.
+	// publish_required is not a failure — no linked schema is published yet, so
+	// nothing exists to bootstrap: idle connected and let the first push (the
+	// publish queues its bootstrap DDL delta) trigger the deferred snapshot,
+	// instead of polling the endpoint on reconnect backoff.
+	bootstrapPending := false
+	if !t.cfg.Bootstrapped {
+		switch err := bootstrap(ctx); {
+		case err == nil:
+		case errors.Is(err, auth.ErrPublishRequired):
+			bootstrapPending = true
+			logger.Printf("no linked schema is published yet — staying connected;" +
+				" publish from the Database Sync page to start the feed")
+		default:
+			return false, fmt.Errorf("bootstrap: %w", err)
 		}
 	}
 
@@ -686,15 +724,32 @@ func connectAndPump(
 	defer conn.Close(websocket.StatusNormalClosure, "client exit")
 	logger.Printf("connected ✓ waiting for deltas")
 
-	// The server pauses the feed with snapshot_required after a schema is
-	// re-linked (publish model) — the snapshot is the only carrier of rows
-	// written while it was unlinked. Re-applying converges: idempotent DDL +
-	// ADD COLUMN convergence + revision-guarded upserts.
-	rebootstrap := func(rctx context.Context) error {
-		return eesync.Bootstrap(rctx, authClient, access.AccessToken, db, logger,
-			failedSnapshotPath(t.key))
+	// Provisioning-rights report for the Sync client card (best effort).
+	if err := conn.Send(ctx, framing.Preflight{Type: "preflight", Report: t.preflight}); err != nil {
+		logger.Printf("warning: could not send preflight report: %v", err)
 	}
-	return true, eesync.Pump(ctx, conn, db, logger, rebootstrap)
+
+	return true, eesync.Pump(ctx, conn, db, logger, bootstrap, bootstrapPending)
+}
+
+// preflightSummary renders one report as a run-banner line.
+func preflightSummary(r framing.PreflightReport) string {
+	part := func(name string, v *bool) string {
+		switch {
+		case v == nil:
+			return name + " unknown"
+		case *v:
+			return name + " ok"
+		default:
+			return name + " MISSING"
+		}
+	}
+	s := fmt.Sprintf("%s, %s, %s",
+		part("CREATEDB", r.CreateDB), part("DDL", r.DDL), part("DML", r.DML))
+	if len(r.Details) > 0 {
+		s += " — " + strings.Join(r.Details, "; ")
+	}
+	return s
 }
 
 // healProfile completes a profile whose pairing predates database metadata

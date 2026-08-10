@@ -198,14 +198,31 @@ func Pump(ctx context.Context, conn *Conn, db *sql.DB, logger *log.Logger,
 					}
 				}
 				logger.Printf("delta apply failed:\n%s", msg)
-				_ = conn.Send(ctx, framing.ApplyError{
+				if err := conn.Send(ctx, framing.ApplyError{
 					Type: "apply_error", DeltaID: failedID, Message: msg,
-				})
-				// Give the frame a moment to flush before closing.
-				time.Sleep(300 * time.Millisecond)
-				conn.Close(websocket.StatusNormalClosure, "apply failed")
-				return PermanentError{Inner: fmt.Errorf(
-					"SQL apply failed — fix the cause and rerun 'ee-database run': %w", err)}
+				}); err != nil {
+					return err
+				}
+				if failedID == nil {
+					// Nothing to quarantine server-side (the failure did not
+					// name a delta), so the same window would come back
+					// unchanged — stop instead of spinning.
+					time.Sleep(300 * time.Millisecond)
+					conn.Close(websocket.StatusNormalClosure, "apply failed")
+					return PermanentError{Inner: fmt.Errorf(
+						"SQL apply failed — fix the cause and rerun 'ee-database run': %w", err)}
+				}
+				// The server quarantines that enrichment's whole batch and
+				// re-pushes without it, so the next frame carries the
+				// FOLLOWING enrichments: stay connected and keep applying
+				// instead of exiting and stalling the queue behind one bad
+				// row. The quarantined work stays visible in the Database
+				// Sync page's Quarantine tab until it is reinjected or dropped.
+				logger.Printf(
+					"delta %d quarantined server-side; continuing with the rest of the queue",
+					*failedID,
+				)
+				continue
 			}
 			if err := conn.Send(ctx, framing.Ack{Type: "ack", UpToID: lastID}); err != nil {
 				return err

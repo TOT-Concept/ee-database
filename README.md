@@ -19,9 +19,14 @@ Entity Enricher ──WSS──▶ ee-database ──SQL──▶ your PostgreSQ
   re-applying converges to the same rows.
 - **Your DSN stays local** — the connection string is passed on the command line
   or stored mode-600 on the machine; it is never sent anywhere.
-- **Halt on failure** — a SQL error rolls back the batch, reports the failing
-  delta to the Entity Enricher UI (Databases page → Sync client), and exits so
-  a poison delta can never be silently skipped.
+- **Quarantine on failure** — a SQL error rolls back the batch and reports the
+  failing delta. The server then sets that enrichment's whole batch aside and
+  re-sends the queue without it, so one bad row can no longer stall everything
+  behind it; the client keeps applying the rest. Nothing is silently skipped:
+  the quarantined work stays listed in the Database Sync page's Quarantine tab
+  until you reinject it (re-projected from current state) or drop it.
+  A failure that names no delta still exits, since there would be nothing to
+  quarantine and the same window would come straight back.
 - **Several databases per machine** — each pairing lives in its own local
   profile; `run --all` syncs every paired database concurrently from one
   process.

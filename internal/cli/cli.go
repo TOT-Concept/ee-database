@@ -96,8 +96,12 @@ Usage:
   ee-database run --all                          Sync every paired database (saved DSNs)
   ee-database host pair --server URL --dsn DSN <token>
                                                  Pair this machine as a managed sync host
+                                                 (one pairing per server; repeatable
+                                                 against several backends)
   ee-database host run                           Auto-claim, provision and sync every
-                                                 database sync assigned to this host
+                                                 database sync assigned to this host,
+                                                 on every paired server (--server URL
+                                                 to run a single pairing)
   ee-database status                             Show pairing state (all profiles)
   ee-database disconnect                         Forget one pairing's local credentials
   ee-database version                            Print version

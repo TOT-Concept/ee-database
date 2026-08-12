@@ -1,18 +1,20 @@
 package cli
 
-// Managed host mode (issue #65): pair a machine once, then every database sync
-// assigned to it is claimed, provisioned and synced automatically.
+// Managed host mode (issue #65): pair a machine once per server, then every
+// database sync assigned to it is claimed, provisioned and synced
+// automatically.
 //
 //	ee-database host pair --server URL --dsn BASE_DSN [--admin-dsn DSN] [--dialect D] [--skip-preflight] <token>
-//	ee-database host run
+//	ee-database host run [--server URL]
 //	ee-database host status
-//	ee-database host disconnect
+//	ee-database host disconnect [--server URL]
 //
-// `host run` holds one control-plane WebSocket (assignment events + host
-// preflight) and one ordinary per-database data-plane loop per claimed sync —
-// managed mode is a profile factory: a claim ends by writing exactly the
-// profile a human creates with `pair` + `run --save-dsn`, so everything
-// downstream is the same code.
+// A machine can hold one pairing per server (dev + prod, staging + prod);
+// `host run` runs them all — per pairing, one control-plane WebSocket
+// (assignment events + host preflight) and one ordinary per-database
+// data-plane loop per claimed sync. Managed mode is a profile factory: a
+// claim ends by writing exactly the profile a human creates with `pair` +
+// `run --save-dsn`, so everything downstream is the same code.
 
 import (
 	"context"
@@ -50,7 +52,7 @@ func cmdHost(args []string, stdout, stderr io.Writer, logger *log.Logger) int {
 	case "status":
 		return cmdHostStatus(stdout, stderr)
 	case "disconnect":
-		return cmdHostDisconnect(stdout, stderr)
+		return cmdHostDisconnect(args[1:], stdout, stderr)
 	case "help", "--help", "-h":
 		printHostHelp(stdout)
 		return 0
@@ -62,13 +64,18 @@ func cmdHost(args []string, stdout, stderr io.Writer, logger *log.Logger) int {
 }
 
 func printHostHelp(w io.Writer) {
-	fmt.Fprint(w, `ee-database host — managed mode: pair this machine once, sync every assigned database
+	fmt.Fprint(w, `ee-database host — managed mode: pair this machine once per server, sync every assigned database
 
 Usage:
   ee-database host pair --server URL --dsn BASE_DSN [flags] <token>
-  ee-database host run          Connect the control plane and sync every assigned database
-  ee-database host status       Show the host pairing
-  ee-database host disconnect   Forget the host pairing (revoke server-side in the UI)
+  ee-database host run [--server URL]
+                                Connect the control plane(s) and sync every assigned
+                                database. One pairing per server may exist; without
+                                --server every pairing runs.
+  ee-database host status       Show all host pairings
+  ee-database host disconnect [--server URL]
+                                Forget one host pairing (revoke server-side in the UI).
+                                --server is required when several servers are paired.
 
 Pair flags:
   --server URL       Entity Enricher base URL (e.g. https://entityenricher.ai)
@@ -136,6 +143,13 @@ func cmdHostPair(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
+	if prev, err := config.LoadHost(c.BaseURL); err == nil {
+		fmt.Fprintf(stdout, "Replacing this machine's existing pairing with %s (host %q)\n",
+			c.BaseURL, prev.Config.HostName)
+	} else if err != nil && !errors.Is(err, config.ErrHostNotPaired) {
+		fmt.Fprintf(stderr, "host pair: %v\n", err)
+		return 1
+	}
 	cfg := &config.HostConfig{
 		HostID:    resp.HostID,
 		HostName:  resp.HostName,
@@ -146,9 +160,19 @@ func cmdHostPair(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "host pair: save: %v\n", err)
 		return 1
 	}
-	dir, _ := config.HostDir()
+	dir, _ := config.HostPairingDir(c.BaseURL)
 	fmt.Fprintf(stdout, "✓ Paired as sync host %q with %s\n", resp.HostName, c.BaseURL)
 	fmt.Fprintf(stdout, "  State stored in %s\n", dir)
+	if pairings, err := config.LoadHosts(); err == nil && len(pairings) > 1 {
+		others := make([]string, 0, len(pairings)-1)
+		for _, p := range pairings {
+			if p.Config.ServerURL != c.BaseURL {
+				others = append(others, p.Config.ServerURL)
+			}
+		}
+		fmt.Fprintf(stdout, "  Also paired with %s — one 'host run' syncs every paired server.\n",
+			strings.Join(others, ", "))
+	}
 	fmt.Fprintln(stdout, "  Run 'ee-database host run' to start syncing assigned databases.")
 	return 0
 }
@@ -156,33 +180,67 @@ func cmdHostPair(args []string, stdout, stderr io.Writer) int {
 // === host status / disconnect ===============================================
 
 func cmdHostStatus(stdout, stderr io.Writer) int {
-	cfg, refresh, baseDSN, adminDSN, err := config.LoadHost()
-	if errors.Is(err, config.ErrHostNotPaired) {
-		fmt.Fprintln(stdout, "Not paired as a sync host. Run 'ee-database host pair' first.")
-		return 0
-	}
+	pairings, err := config.LoadHosts()
 	if err != nil {
 		fmt.Fprintf(stderr, "host status: %v\n", err)
 		return 1
 	}
-	dir, _ := config.HostDir()
-	fmt.Fprintf(stdout, "Sync host %q (%s) @ %s\n", cfg.HostName, cfg.Dialect, cfg.ServerURL)
-	fmt.Fprintf(stdout, "  state dir     %s\n", dir)
-	fmt.Fprintf(stdout, "  base dsn      saved (%d chars)\n", len(baseDSN))
-	fmt.Fprintf(stdout, "  admin dsn     %v\n", adminDSN != "")
-	fmt.Fprintf(stdout, "  token len     %d (hidden)\n", len(refresh))
-	if len(cfg.DatabaseNames) > 0 {
-		fmt.Fprintf(stdout, "  name overrides %v\n", cfg.DatabaseNames)
+	if len(pairings) == 0 {
+		fmt.Fprintln(stdout, "Not paired as a sync host. Run 'ee-database host pair' first.")
+		return 0
+	}
+	for _, p := range pairings {
+		cfg := p.Config
+		dir, _ := config.HostPairingDir(cfg.ServerURL)
+		fmt.Fprintf(stdout, "Sync host %q (%s) @ %s\n", cfg.HostName, cfg.Dialect, cfg.ServerURL)
+		fmt.Fprintf(stdout, "  state dir     %s\n", dir)
+		fmt.Fprintf(stdout, "  base dsn      saved (%d chars)\n", len(p.BaseDSN))
+		fmt.Fprintf(stdout, "  admin dsn     %v\n", p.AdminDSN != "")
+		fmt.Fprintf(stdout, "  token len     %d (hidden)\n", len(p.Refresh))
+		if len(cfg.DatabaseNames) > 0 {
+			fmt.Fprintf(stdout, "  name overrides %v\n", cfg.DatabaseNames)
+		}
 	}
 	return 0
 }
 
-func cmdHostDisconnect(stdout, stderr io.Writer) int {
-	if err := config.ClearHost(); err != nil {
+func cmdHostDisconnect(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("host disconnect", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	server := fs.String("server", "", "Server URL of the pairing to forget")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	pairings, err := config.LoadHosts()
+	if err != nil {
 		fmt.Fprintf(stderr, "host disconnect: %v\n", err)
 		return 1
 	}
-	fmt.Fprintln(stdout, "✓ Host pairing removed locally.")
+	if len(pairings) == 0 {
+		fmt.Fprintln(stdout, "Not paired as a sync host — nothing to disconnect.")
+		return 0
+	}
+	target := strings.TrimSpace(*server)
+	if target == "" {
+		if len(pairings) > 1 {
+			fmt.Fprintln(stderr, "host disconnect: several servers are paired; pick one with --server:")
+			for _, p := range pairings {
+				fmt.Fprintf(stderr, "  %s\n", p.Config.ServerURL)
+			}
+			return 2
+		}
+		target = pairings[0].Config.ServerURL
+	}
+	normalized := auth.New(target).BaseURL
+	if _, err := config.LoadHost(normalized); errors.Is(err, config.ErrHostNotPaired) {
+		fmt.Fprintf(stderr, "host disconnect: no pairing with %s\n", normalized)
+		return 1
+	}
+	if err := config.ClearHost(normalized); err != nil {
+		fmt.Fprintf(stderr, "host disconnect: %v\n", err)
+		return 1
+	}
+	fmt.Fprintf(stdout, "✓ Host pairing with %s removed locally.\n", normalized)
 	fmt.Fprintln(stdout, "  Note: revoke the host on the Database Sync page to fully disable")
 	fmt.Fprintln(stdout, "  this machine's access (that also revokes its claimed credentials).")
 	return 0
@@ -193,44 +251,99 @@ func cmdHostDisconnect(stdout, stderr io.Writer) int {
 func cmdHostRun(args []string, stdout, stderr io.Writer, logger *log.Logger) int {
 	fs := flag.NewFlagSet("host run", flag.ContinueOnError)
 	fs.SetOutput(stderr)
+	server := fs.String("server", "", "Only run the pairing with this server URL")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	cfg, refresh, baseDSN, adminDSN, err := config.LoadHost()
-	if err != nil {
-		fmt.Fprintf(stderr, "host run: %v\n", err)
-		return 1
+	var pairings []*config.HostPairing
+	if s := strings.TrimSpace(*server); s != "" {
+		pairing, err := config.LoadHost(auth.New(s).BaseURL)
+		if err != nil {
+			fmt.Fprintf(stderr, "host run: %v\n", err)
+			return 1
+		}
+		pairings = []*config.HostPairing{pairing}
+	} else {
+		var err error
+		pairings, err = config.LoadHosts()
+		if err != nil {
+			fmt.Fprintf(stderr, "host run: %v\n", err)
+			return 1
+		}
+		if len(pairings) == 0 {
+			fmt.Fprintf(stderr, "host run: %v\n", config.ErrHostNotPaired)
+			return 1
+		}
 	}
-	unlock, err := config.LockHost()
-	if err != nil {
-		fmt.Fprintf(stderr, "host run: %v\n", err)
-		return 1
-	}
-	defer unlock()
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
+	// One runner per paired server, each behind its own pairing lock. A held
+	// lock means that server's runner is alive in another process — skip it
+	// rather than fail the ones that can start.
+	var wg sync.WaitGroup
+	var exitMu sync.Mutex
+	exit, started := 0, 0
+	for _, pairing := range pairings {
+		unlock, err := config.LockHostPairing(pairing.Config.ServerURL)
+		if err != nil {
+			logger.Printf("%s: %v — skipping", pairing.Config.ServerURL, err)
+			continue
+		}
+		started++
+		hostLogger := logger
+		prefix := ""
+		if len(pairings) > 1 {
+			prefix = "[" + pairing.Slug + "] "
+			hostLogger = log.New(os.Stderr, prefix, log.LstdFlags)
+		}
+		wg.Add(1)
+		go func(p *config.HostPairing) {
+			defer wg.Done()
+			defer unlock()
+			code := runHostPairing(ctx, p, prefix, stdout, hostLogger)
+			exitMu.Lock()
+			if code > exit {
+				exit = code
+			}
+			exitMu.Unlock()
+		}(pairing)
+	}
+	if started == 0 {
+		fmt.Fprintln(stderr, "host run: every paired server is already being run by another process")
+		return 1
+	}
+	wg.Wait()
+	return exit
+}
+
+// runHostPairing runs one server's control-plane loop until cancel or a
+// permanent error. Other pairings keep running either way.
+func runHostPairing(ctx context.Context, pairing *config.HostPairing,
+	prefix string, stdout io.Writer, logger *log.Logger) int {
+	cfg := pairing.Config
 	// Re-check and report, never exit: a host that lost CREATEDB still syncs
 	// its already-claimed databases correctly (their ownership is intact);
 	// the degraded report drops it from auto-assign eligibility server-side.
-	report := apply.HostPreflight(ctx, cfg.Dialect, baseDSN, adminDSN)
-	fmt.Fprintf(stdout, "Preflight (host): %s\n", preflightSummary(report))
+	report := apply.HostPreflight(ctx, cfg.Dialect, pairing.BaseDSN, pairing.AdminDSN)
+	fmt.Fprintf(stdout, "%sPreflight (host): %s\n", prefix, preflightSummary(report))
 
 	runner := &hostRunner{
 		ctx:       ctx,
 		cfg:       cfg,
-		refresh:   refresh,
-		baseDSN:   baseDSN,
-		adminDSN:  adminDSN,
+		refresh:   pairing.Refresh,
+		baseDSN:   pairing.BaseDSN,
+		adminDSN:  pairing.AdminDSN,
 		preflight: report,
 		auth:      auth.New(cfg.ServerURL),
 		logger:    logger,
+		logPrefix: prefix,
 		stdout:    stdout,
 		children:  make(map[string]*managedChild),
 	}
 	logger.Printf("ee-database %s host %q connecting to %s", Version, cfg.HostName, cfg.ServerURL)
-	err = runner.runForever()
+	err := runner.runForever()
 	runner.stopAll()
 	runner.wg.Wait()
 	if err != nil && !errors.Is(err, context.Canceled) {
@@ -259,6 +372,7 @@ type hostRunner struct {
 	preflight framing.PreflightReport
 	auth      *auth.Client
 	logger    *log.Logger
+	logPrefix string // "[slug] " when several pairings run in one process
 	stdout    io.Writer
 
 	mu       sync.Mutex
@@ -448,10 +562,10 @@ func (r *hostRunner) ensure(reg framing.HostRegistration) {
 		return
 	}
 	if ensured.RoleCreated {
-		fmt.Fprintf(r.stdout, "✓ Created role for %s\n", reg.Name)
+		fmt.Fprintf(r.stdout, "%s✓ Created role for %s\n", r.logPrefix, reg.Name)
 	}
 	if ensured.DatabaseCreated {
-		fmt.Fprintf(r.stdout, "✓ Created database %s for %s\n", ensured.Name, reg.Name)
+		fmt.Fprintf(r.stdout, "%s✓ Created database %s for %s\n", r.logPrefix, ensured.Name, reg.Name)
 	}
 	db, err := apply.Open(cfgP.Dialect, dsn)
 	if err != nil {
@@ -468,7 +582,7 @@ func (r *hostRunner) ensure(reg framing.HostRegistration) {
 
 	t := &target{key: reg.DatabaseID, cfg: cfgP, refresh: refreshP, dsn: dsn}
 	t.preflight = apply.Preflight(r.ctx, cfgP.Dialect, dsn, db)
-	fmt.Fprintf(r.stdout, "Preflight %s: %s\n", targetLabel(t), preflightSummary(t.preflight))
+	fmt.Fprintf(r.stdout, "%sPreflight %s: %s\n", r.logPrefix, targetLabel(t), preflightSummary(t.preflight))
 
 	childCtx, childCancel := context.WithCancel(r.ctx)
 	child := &managedChild{cancel: childCancel, done: make(chan struct{})}
@@ -476,7 +590,7 @@ func (r *hostRunner) ensure(reg framing.HostRegistration) {
 	r.children[reg.DatabaseID] = child
 	r.mu.Unlock()
 
-	childLogger := log.New(os.Stderr, "["+targetLabel(t)+"] ", log.LstdFlags)
+	childLogger := log.New(os.Stderr, r.logPrefix+"["+targetLabel(t)+"] ", log.LstdFlags)
 	childLogger.Printf("syncing (managed)")
 	r.wg.Add(1)
 	go func() {

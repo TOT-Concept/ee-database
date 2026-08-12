@@ -16,8 +16,8 @@ import (
 	"github.com/coder/websocket"
 
 	"github.com/TOT-Concept/ee-database/internal/apply"
-	"github.com/TOT-Concept/ee-database/internal/framing"
 	"github.com/TOT-Concept/ee-database/internal/auth"
+	"github.com/TOT-Concept/ee-database/internal/framing"
 )
 
 const (
@@ -28,7 +28,7 @@ const (
 
 // Version is the CLI release version — single source for the version command,
 // run banners and the wire agent identity below.
-const Version = "1.4.0"
+const Version = "1.5.0"
 
 // Agent identifies this client in User-Agent and hello frames.
 const Agent = "ee-database/" + Version

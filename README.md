@@ -117,9 +117,9 @@ publish starts the feed on its own — no restart needed.
 | `run … --create-missing` | Create the target database first when it does not exist (postgres/mysql; sqlite files are created anyway) |
 | `run … --create-missing --admin-dsn DSN` | Also create the target DSN's missing role/user via an admin connection (never stored) |
 | `run --all` | Sync every paired database concurrently (each needs a saved DSN) |
-| `host pair --server URL --dsn BASE_DSN [--admin-dsn DSN] <token>` | Pair this machine as a managed sync host (token from the Sync hosts dialog — the "Sync hosts" toolbar button on the Database Sync page) |
-| `host run` | Managed mode: auto-claim, create and sync every database sync assigned to this host |
-| `host status` / `host disconnect` | Show / forget the host pairing |
+| `host pair --server URL --dsn BASE_DSN [--admin-dsn DSN] <token>` | Pair this machine as a managed sync host (token from the Sync hosts dialog — the "Sync hosts" toolbar button on the Database Sync page); one pairing per server, so several backends can be paired side by side |
+| `host run [--server URL]` | Managed mode: auto-claim, create and sync every database sync assigned to this host — every paired server at once, or one with `--server` |
+| `host status` / `host disconnect [--server URL]` | Show / forget host pairings (`--server` picks one when several servers are paired) |
 | `status` | Show pairing state (all paired databases) |
 | `disconnect` | Forget one pairing's local credentials (revoke server-side in the UI) |
 | `version` | Print version |
@@ -127,8 +127,10 @@ publish starts the feed on its own — no restart needed.
 ## Managed host mode
 
 Pairing is per database; managed mode moves the ceremony one level up. Pair the
-machine once — `--dsn` is a **base server DSN with no database name** (it never
-leaves the machine) — then `host run` holds one control-plane WebSocket and
+machine once per server — `--dsn` is a **base server DSN with no database name**
+(it never leaves the machine) — then `host run` holds one control-plane WebSocket
+per paired server (pair against several backends — say staging and production —
+and one `host run` syncs them all; `--server URL` restricts it to one) and
 reacts to assignments made in the Entity Enricher UI (or API): it claims the
 credential, derives the database's DSN from the base DSN plus the
 server-suggested snake_cased name (override per registration via

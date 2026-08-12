@@ -103,6 +103,26 @@ table) — prints the result and reports it to the Databases page's Sync client
 card, so a missing grant is visible there before deltas fail to apply. The
 check is advisory: it never blocks the run.
 
+### Required database rights (PostgreSQL)
+
+Assuming the target database already exists, the login needs only:
+
+- `CONNECT` on the database,
+- `USAGE` and `CREATE` on the target schema (note: since PostgreSQL 15,
+  `public` no longer grants `CREATE` to everyone by default).
+
+Everything else follows from **ownership**: the client creates the replica
+tables itself, so it owns them, and ownership implies the `INSERT` / `UPDATE`
+/ `DELETE` / `SELECT` the data deltas need. Ownership is not optional — the
+feed also ships migration statements (`ALTER TABLE …`, `CREATE INDEX …`) that
+PostgreSQL restricts to the **table owner**; no combination of `GRANT`s
+substitutes for it, and `IF NOT EXISTS` does not help (ownership is checked
+before the duplicate-name check, so even re-applying an existing index fails
+for a non-owner). If the replica tables pre-exist under a different owner, the
+preflight passes (the login can create *new* tables) but the first migration
+delta will fail — transfer them with `ALTER TABLE … OWNER TO <login>` (or
+grant the login membership in the owning role) rather than adding grants.
+
 If none of the database's linked schemas is published yet, the first run has
 nothing to bootstrap: the client stays connected and waits, and the first
 publish starts the feed on its own — no restart needed.

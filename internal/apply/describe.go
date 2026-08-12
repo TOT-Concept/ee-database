@@ -52,24 +52,12 @@ func locateInScript(sqlText string, pos int) (int, string) {
 			} else {
 				end += i
 			}
-			return line, capLine(sqlText[lineStart:end])
+			return line, strings.TrimSpace(sqlText[lineStart:end])
 		}
 		if r == '\n' {
 			line++
 			lineStart = i + 1
 		}
 	}
-	return line, capLine(sqlText[lineStart:])
-}
-
-// capLine trims and bounds one script line for log output (entity upserts can
-// be thousands of characters wide).
-func capLine(s string) string {
-	s = strings.TrimSpace(s)
-	const maxRunes = 160
-	runes := []rune(s)
-	if len(runes) > maxRunes {
-		return string(runes[:maxRunes]) + "…"
-	}
-	return s
+	return line, strings.TrimSpace(sqlText[lineStart:])
 }

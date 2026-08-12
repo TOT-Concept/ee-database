@@ -56,9 +56,12 @@ func TestLocateInScriptBounds(t *testing.T) {
 	if line != 2 || text != "SELECT 2;" {
 		t.Errorf("out-of-range cursor should land on the last line, got %d %q", line, text)
 	}
+	// The located line is reported whole — it becomes the quarantine reason
+	// shown (and copied) in the Database Sync page, where a truncated
+	// statement is useless.
 	long := "SELECT '" + strings.Repeat("é", 300) + "';"
-	_, capped := locateInScript(long, 3)
-	if !strings.HasSuffix(capped, "…") || len([]rune(capped)) != 161 {
-		t.Errorf("long line not rune-capped: %d runes", len([]rune(capped)))
+	_, text = locateInScript(long, 3)
+	if text != long {
+		t.Errorf("long line must be reported untruncated, got %d runes", len([]rune(text)))
 	}
 }

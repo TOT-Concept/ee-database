@@ -1,0 +1,12 @@
+# golangci-lint v2 configuration.
+#
+# v2 dropped the v1 default exclusions, whose EXC0001 preset is the only reason
+# this codebase ever passed: writing help text and error lines with
+# fmt.Fprint* to stdout/stderr is deliberate, and checking each return value
+# would bury the CLI in noise. `std-error-handling` restores exactly that.
+version: "2"
+
+linters:
+  exclusions:
+    presets:
+      - std-error-handling

@@ -606,6 +606,41 @@ func (r *hostRunner) ensure(reg framing.HostRegistration) {
 			r.mu.Unlock()
 		}()
 		err := runForever(childCtx, t, db, childLogger)
+		if errors.Is(err, errCredentialRevoked) && childCtx.Err() == nil {
+			// The stored token died out from under this profile — a previous
+			// classic pairing, or a claim minted by a since-revoked host. The
+			// claim endpoint sanctions re-claim by the assigned host as
+			// rotation, so the stale credential is disposable: mint a fresh
+			// one in place, keeping the profile's saved DSN and bootstrap
+			// flag so the local database name and state survive. One attempt
+			// per start — a second 401 means it was revoked again mid-run.
+			childLogger.Printf("credential revoked — re-claiming via host")
+			claim, cerr := r.claim(reg.DatabaseID)
+			var notClaimable auth.ErrNotClaimable
+			switch {
+			case errors.As(cerr, &notClaimable):
+				childLogger.Printf("stopped: %v — revoke the other client's "+
+					"credential first", cerr)
+				return
+			case cerr != nil:
+				childLogger.Printf("stopped: re-claim failed: %v "+
+					"(retried on next reconcile)", cerr)
+				return
+			}
+			if serr := config.SaveProfile(reg.DatabaseID, cfgP, claim.RefreshToken); serr != nil {
+				// The rotated token still drives this run; the next start
+				// lands back here and re-claims again.
+				childLogger.Printf("warning: could not persist rotated token: %v", serr)
+			}
+			t.refresh = claim.RefreshToken
+			childLogger.Printf("re-claimed — resuming sync")
+			err = runForever(childCtx, t, db, childLogger)
+			if errors.Is(err, errCredentialRevoked) {
+				childLogger.Printf("stopped: credential revoked again after " +
+					"re-claim — retried on next reconcile")
+				return
+			}
+		}
 		if err != nil && !errors.Is(err, context.Canceled) {
 			childLogger.Printf("stopped: %v", err)
 		} else {

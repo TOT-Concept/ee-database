@@ -666,6 +666,13 @@ func runForever(
 	}
 }
 
+// errCredentialRevoked marks the exchange 401: the stored refresh token was
+// revoked or rotated server-side. A classic runner can only stop and ask for a
+// re-pair; a managed child re-claims through its host instead (the claim
+// endpoint sanctions re-claim by the assigned host as rotation), so the stale
+// profile never dead-ends the sync — see hostRunner.ensure.
+var errCredentialRevoked = errors.New("credential revoked or rotated")
+
 func connectAndPump(
 	ctx context.Context,
 	authClient *auth.Client,
@@ -679,7 +686,7 @@ func connectAndPump(
 	if err != nil {
 		if strings.Contains(err.Error(), "401") {
 			return false, eesync.PermanentError{Inner: fmt.Errorf(
-				"credential revoked or rotated — run 'ee-database pair' again: %w", err)}
+				"%w — run 'ee-database pair' again: %v", errCredentialRevoked, err)}
 		}
 		return false, err
 	}

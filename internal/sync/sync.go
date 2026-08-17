@@ -28,7 +28,7 @@ const (
 
 // Version is the CLI release version — single source for the version command,
 // run banners and the wire agent identity below.
-const Version = "1.5.0"
+const Version = "1.5.1"
 
 // Agent identifies this client in User-Agent and hello frames.
 const Agent = "ee-database/" + Version

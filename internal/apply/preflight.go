@@ -53,6 +53,7 @@ func Preflight(ctx context.Context, dialect, dsn string, db *sql.DB) framing.Pre
 		} else {
 			report.CreateDB = &createDB
 		}
+		report.Trigram = probeTrigram(ctx, db, &report.Details)
 	case "mysql":
 		if cfg, err := gomysql.ParseDSN(dsn); err == nil {
 			report.User, report.Database = cfg.User, cfg.DBName
@@ -163,6 +164,32 @@ func HostPreflight(ctx context.Context, dialect, baseDSN, adminDSN string) frami
 		report.Details = append(report.Details, fmt.Sprintf("unsupported dialect %q", dialect))
 	}
 	return report
+}
+
+// probeTrigram checks for the pg_trgm extension and, when absent, tries to
+// install it right here — a credential the consumer granted owner rights just
+// works, with no ceremony. The refusal lands in details rather than an error:
+// search-index DDL is self-guarded server-side (a DO block gated on
+// pg_extension), so a missing extension only means those indexes no-op until
+// a database owner runs CREATE EXTENSION pg_trgm.
+func probeTrigram(ctx context.Context, db *sql.DB, details *[]string) *bool {
+	var present bool
+	if err := db.QueryRowContext(ctx,
+		"SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_trgm')",
+	).Scan(&present); err != nil {
+		*details = append(*details, fmt.Sprintf("pg_trgm check failed: %v", err))
+		return nil
+	}
+	if !present {
+		if _, err := db.ExecContext(ctx, "CREATE EXTENSION IF NOT EXISTS pg_trgm"); err == nil {
+			present = true
+			*details = append(*details, "pg_trgm installed by this client")
+		} else {
+			*details = append(*details,
+				fmt.Sprintf("pg_trgm not installed and CREATE EXTENSION was refused: %v", err))
+		}
+	}
+	return &present
 }
 
 func probeDDLDML(ctx context.Context, db *sql.DB, details *[]string) (ddl, dml *bool) {

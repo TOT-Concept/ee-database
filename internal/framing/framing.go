@@ -38,13 +38,19 @@ type Ping struct {
 // for a delta that would never apply. Nil booleans mean "not determinable" on
 // that dialect; the server stamps the receive time.
 type PreflightReport struct {
-	Dialect  string   `json:"dialect"`
-	Database string   `json:"database,omitempty"`
-	User     string   `json:"user,omitempty"`
-	CreateDB *bool    `json:"create_db"`
-	DDL      *bool    `json:"ddl"`
-	DML      *bool    `json:"dml"`
-	Details  []string `json:"details,omitempty"`
+	Dialect  string `json:"dialect"`
+	Database string `json:"database,omitempty"`
+	User     string `json:"user,omitempty"`
+	CreateDB *bool  `json:"create_db"`
+	DDL      *bool  `json:"ddl"`
+	DML      *bool  `json:"dml"`
+	// Trigram reports pg_trgm availability AFTER the client's own
+	// CREATE EXTENSION attempt (postgres only; nil elsewhere). Advisory like
+	// the rest: search-index DDL is self-guarded server-side and no-ops
+	// without the extension, so a false here means "search indexes will not
+	// materialize", never "the sync will fail".
+	Trigram *bool    `json:"trigram,omitempty"`
+	Details []string `json:"details,omitempty"`
 }
 
 type Preflight struct {

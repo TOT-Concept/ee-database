@@ -583,6 +583,15 @@ func (r *hostRunner) ensure(reg framing.HostRegistration) {
 	t := &target{key: reg.DatabaseID, cfg: cfgP, refresh: refreshP, dsn: dsn}
 	t.preflight = apply.Preflight(r.ctx, cfgP.Dialect, dsn, db)
 	fmt.Fprintf(r.stdout, "%sPreflight %s: %s\n", r.logPrefix, targetLabel(t), preflightSummary(t.preflight))
+	// Unconditional in host mode (the content-gated advisory stays too): the
+	// registrations assigned to this host change over time, so a replica that
+	// carries no search index today may be handed one tomorrow — the operator
+	// hears about the missing extension at claim time, not mid-feed.
+	if t.preflight.Trigram != nil && !*t.preflight.Trigram {
+		r.logger.Printf("%s: warning: pg_trgm extension not installed — database search "+
+			"indexes will no-op until a database owner runs 'CREATE EXTENSION pg_trgm;' "+
+			"on this replica", reg.Name)
+	}
 
 	childCtx, childCancel := context.WithCancel(r.ctx)
 	child := &managedChild{cancel: childCancel, done: make(chan struct{})}

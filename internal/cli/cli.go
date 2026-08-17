@@ -447,6 +447,9 @@ type target struct {
 	refresh   string
 	dsn       string
 	preflight framing.PreflightReport
+	// trigram is lazily built from the preflight on first connect and shared
+	// across reconnects, so the missing-pg_trgm advisory fires once per run.
+	trigram *eesync.TrigramAdvisor
 }
 
 // cmdRun runs the apply loop(s) until interrupted.
@@ -692,13 +695,19 @@ func connectAndPump(
 	}
 	healProfile(t, access, logger)
 
+	if t.trigram == nil {
+		t.trigram = &eesync.TrigramAdvisor{
+			Missing: t.preflight.Trigram != nil && !*t.preflight.Trigram,
+		}
+	}
+
 	// One closure serves the first bootstrap, the publish_required deferral and
 	// the snapshot_required re-bootstrap (the snapshot is the only carrier of
 	// rows written while a schema was unlinked). Re-applying converges:
 	// idempotent DDL + ADD COLUMN convergence + revision-guarded upserts.
 	bootstrap := func(rctx context.Context) error {
 		if err := eesync.Bootstrap(rctx, authClient, access.AccessToken, db, logger,
-			failedSnapshotPath(t.key)); err != nil {
+			failedSnapshotPath(t.key), t.trigram); err != nil {
 			return err
 		}
 		if !t.cfg.Bootstrapped {
@@ -740,7 +749,7 @@ func connectAndPump(
 		logger.Printf("warning: could not send preflight report: %v", err)
 	}
 
-	return true, eesync.Pump(ctx, conn, db, logger, bootstrap, bootstrapPending)
+	return true, eesync.Pump(ctx, conn, db, logger, bootstrap, bootstrapPending, t.trigram)
 }
 
 // preflightSummary renders one report as a run-banner line.
@@ -757,6 +766,9 @@ func preflightSummary(r framing.PreflightReport) string {
 	}
 	s := fmt.Sprintf("%s, %s, %s",
 		part("CREATEDB", r.CreateDB), part("DDL", r.DDL), part("DML", r.DML))
+	if r.Trigram != nil {
+		s += ", " + part("pg_trgm", r.Trigram)
+	}
 	if len(r.Details) > 0 {
 		s += " — " + strings.Join(r.Details, "; ")
 	}

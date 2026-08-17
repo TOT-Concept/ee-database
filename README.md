@@ -123,6 +123,18 @@ preflight passes (the login can create *new* tables) but the first migration
 delta will fail — transfer them with `ALTER TABLE … OWNER TO <login>` (or
 grant the login membership in the owning role) rather than adding grants.
 
+### Database search indexes (pg_trgm)
+
+Schemas can flag text properties for substring search; on PostgreSQL those ship
+as trigram indexes, which need the `pg_trgm` extension. On connect the client
+checks for it and, when the login is allowed to, installs it itself
+(`CREATE EXTENSION IF NOT EXISTS pg_trgm`). When it cannot, the sync still runs
+in full — the search-index statements are self-guarded and simply no-op — and a
+warning explains the one-time fix: have a database owner run
+`CREATE EXTENSION pg_trgm;` on the replica. The indexes then materialize on the
+next publish or reconcile. MySQL and SQLite replicas never receive search-index
+statements.
+
 If none of the database's linked schemas is published yet, the first run has
 nothing to bootstrap: the client stays connected and waits, and the first
 publish starts the feed on its own — no restart needed.

@@ -11,6 +11,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/coder/websocket"
@@ -28,10 +29,36 @@ const (
 
 // Version is the CLI release version — single source for the version command,
 // run banners and the wire agent identity below.
-const Version = "1.5.1"
+const Version = "1.5.2"
 
 // Agent identifies this client in User-Agent and hello frames.
 const Agent = "ee-database/" + Version
+
+// TrigramAdvisor warns — once per target, never blocking — when the feed
+// actually ships pg_trgm search indexes at a replica that lacks the extension.
+// The DDL is self-guarded server-side (a DO block gated on pg_extension), so
+// those statements silently no-op; this advisory is what tells the operator
+// WHY the index is not there and how to get it. Content-gated on the SQL so a
+// replica whose schemas carry no `search` intent never sees the message
+// (host mode additionally warns unconditionally at claim time, since its
+// assigned registrations change over time).
+type TrigramAdvisor struct {
+	Missing bool
+	warned  bool
+}
+
+// Check scans one SQL script and emits the advisory on the first sight of a
+// trigram index. Nil-safe so callers without a report can pass nil through.
+func (a *TrigramAdvisor) Check(sqlText string, logger *log.Logger) {
+	if a == nil || !a.Missing || a.warned || !strings.Contains(sqlText, "gin_trgm_ops") {
+		return
+	}
+	a.warned = true
+	logger.Printf("warning: this sync ships database search indexes but the pg_trgm " +
+		"extension is not installed — they are skipped (no-op) until a database owner " +
+		"runs 'CREATE EXTENSION pg_trgm;' on this replica; data and all other DDL " +
+		"apply normally, and the indexes materialize on the next publish or reconcile")
+}
 
 // PermanentError stops the reconnect loop (revoked credential, apply failure).
 type PermanentError struct{ Inner error }
@@ -131,7 +158,8 @@ func (c *Conn) Close(code websocket.StatusCode, reason string) {
 // replay-safe either way, since the snapshot and the queued deltas carry the
 // same revision-guarded statements.
 func Pump(ctx context.Context, conn *Conn, db *sql.DB, logger *log.Logger,
-	rebootstrap func(context.Context) error, bootstrapPending bool) error {
+	rebootstrap func(context.Context) error, bootstrapPending bool,
+	trigram *TrigramAdvisor) error {
 	// Keepalive: drives intermediate proxies; the server answers pong frames.
 	pingCtx, pingCancel := context.WithCancel(ctx)
 	defer pingCancel()
@@ -186,6 +214,9 @@ func Pump(ctx context.Context, conn *Conn, db *sql.DB, logger *log.Logger,
 			}
 			logger.Printf("applying %d delta(s) (%d .. %d)",
 				len(f.Deltas), f.Deltas[0].ID, f.Deltas[len(f.Deltas)-1].ID)
+			for i := range f.Deltas {
+				trigram.Check(f.Deltas[i].SQL, logger)
+			}
 			lastID, failedID, err := apply.Batch(ctx, db, f.Deltas)
 			if err != nil {
 				msg := err.Error()
@@ -241,12 +272,13 @@ func Pump(ctx context.Context, conn *Conn, db *sql.DB, logger *log.Logger,
 // saved to failDump (when non-empty) so the failing statement can be
 // inspected; a later success removes the stale dump.
 func Bootstrap(ctx context.Context, client *auth.Client, accessToken string, db *sql.DB,
-	logger *log.Logger, failDump string) error {
+	logger *log.Logger, failDump string, trigram *TrigramAdvisor) error {
 	logger.Printf("bootstrapping: fetching snapshot…")
 	sqlText, cursor, err := client.FetchSnapshot(ctx, accessToken)
 	if err != nil {
 		return err
 	}
+	trigram.Check(sqlText, logger)
 	if err := apply.Snapshot(ctx, db, sqlText); err != nil {
 		logger.Printf("snapshot apply failed (nothing applied — single transaction):\n%s",
 			apply.DescribeError(sqlText, err))

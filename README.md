@@ -139,6 +139,45 @@ If none of the database's linked schemas is published yet, the first run has
 nothing to bootstrap: the client stays connected and waits, and the first
 publish starts the feed on its own — no restart needed.
 
+## Reading the apply log
+
+Each pushed window is applied in **one transaction** — the server never ends a
+window inside an enrichment — and is reported with the shape it wrote, per
+table:
+
+```
+applying 12 delta(s) (10831 .. 10842) in one transaction
+applied 12 delta(s) in 84ms — 38 statement(s): mushroom 4 upserts, mushroom_common_names 12 upserts + 4 prunes, mushroom_human_uses 14 upserts + 4 prunes
+acked up to delta 10842
+```
+
+Read it as the write shape of the feed, which is what sizing a nightly
+re-enrichment needs:
+
+- **upsert** — one `INSERT … ON CONFLICT DO UPDATE` per projected row, so the
+  count *is* the row count. Children are reconciled **in place**; they are
+  never wiped and re-inserted.
+- **prune** — a revision-guarded `DELETE` removing the child or junction rows
+  the new payload no longer claims. One statement per relationship, however
+  many rows it clears.
+- **delete** — a tombstone (an entity deleted upstream) or its owned cascade.
+- **wipe** — an unscoped `DELETE`; only a keyless parent's children are
+  replaced wholesale.
+- **ddl** — schema deltas: table, column and index statements, including the
+  ones the feed guards inside a `DO` block.
+
+`--verbose` adds one line per delta, with its id, kind, entity type, wall time
+and its own shape — the per-entity cost, which is otherwise unrecoverable once
+a delta is acked and purged server-side:
+
+```
+applying 12 delta(s) (10831 .. 10842) in one transaction
+  delta 10831 data upsert Mushroom (7ms) — 3 statement(s): mushroom 1 upsert, mushroom_common_names 3 upserts + 1 prune
+  …
+```
+
+It also reports the bootstrap snapshot's table inventory and apply time.
+
 ## Commands
 
 | Command | Purpose |
@@ -149,6 +188,7 @@ publish starts the feed on its own — no restart needed.
 | `run … --create-missing` | Create the target database first when it does not exist (postgres/mysql; sqlite files are created anyway) |
 | `run … --create-missing --admin-dsn DSN` | Also create the target DSN's missing role/user via an admin connection (never stored) |
 | `run --all` | Sync every paired database concurrently (each needs a saved DSN) |
+| `run … --verbose` / `host run … --verbose` | Log every delta's write shape and timing, not just the per-window summary |
 | `host pair --server URL --dsn BASE_DSN [--admin-dsn DSN] <token>` | Pair this machine as a managed sync host (token from the Sync hosts dialog — the "Sync hosts" toolbar button on the Database Sync page); one pairing per server, so several backends can be paired side by side |
 | `host run [--server URL]` | Managed mode: auto-claim, create and sync every database sync assigned to this host — every paired server at once, or one with `--server` |
 | `host status` / `host disconnect [--server URL]` | Show / forget host pairings (`--server` picks one when several servers are paired) |

@@ -14,6 +14,7 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"fmt"
+	"time"
 
 	gomysql "github.com/go-sql-driver/mysql"
 	"github.com/jackc/pgx/v5"
@@ -75,26 +76,76 @@ func Snapshot(ctx context.Context, db *sql.DB, sqlText string) error {
 	return execErr
 }
 
+// DeltaResult is one applied delta's identity, write shape and wall time.
+// Only filled when the caller asks for per-delta detail (--verbose).
+type DeltaResult struct {
+	ID         int64
+	Kind       string
+	Op         string
+	EntityType string
+	Shape      Shape
+	Elapsed    time.Duration
+}
+
+// BatchResult reports what one applied window did to the replica: how long the
+// transaction took and, per table, which statement shapes it ran. The window is
+// the transaction — the server never splits an enrichment across two — so this
+// is also the answer to "how do deltas group into transactions".
+type BatchResult struct {
+	LastID   int64
+	FailedID *int64
+	Elapsed  time.Duration
+	Shape    Shape
+	Deltas   []DeltaResult
+}
+
 // Batch applies deltas in id order inside one transaction.
 //
 // On failure it rolls back and returns the offending delta's id — nothing from
 // the batch is committed, the server's lease expires, and the same window is
 // redelivered after the cause is fixed.
-func Batch(ctx context.Context, db *sql.DB, deltas []framing.Delta) (lastID int64, failedID *int64, err error) {
+//
+// detail additionally keeps each delta's own shape and timing; the aggregate
+// shape is always computed (one pass over SQL the transaction is about to run
+// costs nothing next to running it) so the apply log can state the write shape
+// instead of a delta count — the deltas are gone once acked.
+func Batch(ctx context.Context, db *sql.DB, deltas []framing.Delta, detail bool) (BatchResult, error) {
+	res := BatchResult{}
+	started := time.Now()
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
-		return 0, nil, fmt.Errorf("begin: %w", err)
+		return res, fmt.Errorf("begin: %w", err)
+	}
+	if detail {
+		res.Deltas = make([]DeltaResult, 0, len(deltas))
 	}
 	for i := range deltas {
 		d := deltas[i]
+		shape := Summarize(d.SQL)
+		stmtStart := time.Now()
 		if _, err := tx.ExecContext(ctx, d.SQL); err != nil {
 			_ = tx.Rollback()
-			return 0, &d.ID, fmt.Errorf("delta %d (%s %s): %w", d.ID, d.Kind, d.Op, err)
+			res.FailedID = &d.ID
+			res.Elapsed = time.Since(started)
+			return res, fmt.Errorf("delta %d (%s %s): %w", d.ID, d.Kind, d.Op, err)
 		}
-		lastID = d.ID
+		res.Shape.Merge(shape)
+		if detail {
+			entityType := ""
+			if d.EntityType != nil {
+				entityType = *d.EntityType
+			}
+			res.Deltas = append(res.Deltas, DeltaResult{
+				ID: d.ID, Kind: d.Kind, Op: d.Op, EntityType: entityType,
+				Shape: shape, Elapsed: time.Since(stmtStart),
+			})
+		}
+		res.LastID = d.ID
 	}
 	if err := tx.Commit(); err != nil {
-		return 0, nil, fmt.Errorf("commit: %w", err)
+		res.Elapsed = time.Since(started)
+		return res, fmt.Errorf("commit: %w", err)
 	}
-	return lastID, nil, nil
+	res.Elapsed = time.Since(started)
+	return res, nil
 }

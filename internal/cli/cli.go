@@ -3,7 +3,7 @@
 // Subcommands:
 //
 //	ee-database pair --server URL [refresh-token]
-//	ee-database run [--database NAME|ID | --all] [--dsn DSN] [--save-dsn] [--skip-bootstrap] [--create-missing]
+//	ee-database run [--database NAME|ID | --all] [--dsn DSN] [--save-dsn] [--skip-bootstrap] [--create-missing] [--verbose]
 //	ee-database status [--database NAME|ID]
 //	ee-database disconnect [--database NAME|ID]
 //	ee-database version
@@ -98,7 +98,7 @@ Usage:
                                                  Pair this machine as a managed sync host
                                                  (one pairing per server; repeatable
                                                  against several backends)
-  ee-database host run                           Auto-claim, provision and sync every
+  ee-database host run [--verbose]               Auto-claim, provision and sync every
                                                  database sync assigned to this host,
                                                  on every paired server (--server URL
                                                  to run a single pairing)
@@ -127,6 +127,10 @@ Run flags:
                      target DSN then needs no create rights of its own.
   --all              Run every paired database concurrently. Each profile must
                      have a saved DSN (--dsn/--save-dsn are rejected).
+  --verbose          Log every delta's write shape (per-table upserts, prunes,
+                     DDL) and how long it took; 'host run' takes it too.
+                     Without it each applied window still reports its
+                     per-table shape on one line.
 
 Environment:
   EE_DATABASE_DSN    DSN fallback when --dsn is not given (single-database runs)
@@ -450,6 +454,8 @@ type target struct {
 	// trigram is lazily built from the preflight on first connect and shared
 	// across reconnects, so the missing-pg_trgm advisory fires once per run.
 	trigram *eesync.TrigramAdvisor
+	// verbose adds the per-delta write shape and timing to this target's log.
+	verbose bool
 }
 
 // cmdRun runs the apply loop(s) until interrupted.
@@ -463,6 +469,7 @@ func cmdRun(args []string, stdout, stderr io.Writer, logger *log.Logger) int {
 	adminDSN := fs.String("admin-dsn", "", "Admin connection used by --create-missing to bootstrap the target role and database")
 	database := fs.String("database", "", "Pairing to run (name or id)")
 	all := fs.Bool("all", false, "Run every paired database concurrently")
+	verbose := fs.Bool("verbose", false, "Log each delta's write shape and timing")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -499,7 +506,9 @@ func cmdRun(args []string, stdout, stderr io.Writer, logger *log.Logger) int {
 				fmt.Fprintf(stderr, "run: %s: %v\n", p.Label(), err)
 				return 1
 			}
-			targets = append(targets, &target{key: p.Key, cfg: p.Config, refresh: refresh, dsn: dsn})
+			targets = append(targets, &target{
+				key: p.Key, cfg: p.Config, refresh: refresh, dsn: dsn, verbose: *verbose,
+			})
 		}
 		if len(missing) > 0 {
 			fmt.Fprintf(stderr, "run: no saved DSN for: %s\n", strings.Join(missing, ", "))
@@ -534,7 +543,9 @@ func cmdRun(args []string, stdout, stderr io.Writer, logger *log.Logger) int {
 				return 1
 			}
 		}
-		targets = append(targets, &target{key: p.Key, cfg: p.Config, refresh: refresh, dsn: dsn})
+		targets = append(targets, &target{
+			key: p.Key, cfg: p.Config, refresh: refresh, dsn: dsn, verbose: *verbose,
+		})
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -700,6 +711,11 @@ func connectAndPump(
 			Missing: t.preflight.Trigram != nil && !*t.preflight.Trigram,
 		}
 	}
+	opts := eesync.Options{
+		Trigram:  t.trigram,
+		FailDump: failedSnapshotPath(t.key),
+		Verbose:  t.verbose,
+	}
 
 	// One closure serves the first bootstrap, the publish_required deferral and
 	// the snapshot_required re-bootstrap (the snapshot is the only carrier of
@@ -707,7 +723,7 @@ func connectAndPump(
 	// idempotent DDL + ADD COLUMN convergence + revision-guarded upserts.
 	bootstrap := func(rctx context.Context) error {
 		if err := eesync.Bootstrap(rctx, authClient, access.AccessToken, db, logger,
-			failedSnapshotPath(t.key), t.trigram); err != nil {
+			opts); err != nil {
 			return err
 		}
 		if !t.cfg.Bootstrapped {
@@ -749,7 +765,7 @@ func connectAndPump(
 		logger.Printf("warning: could not send preflight report: %v", err)
 	}
 
-	return true, eesync.Pump(ctx, conn, db, logger, bootstrap, bootstrapPending, t.trigram)
+	return true, eesync.Pump(ctx, conn, db, logger, bootstrap, bootstrapPending, opts)
 }
 
 // preflightSummary renders one report as a run-banner line.

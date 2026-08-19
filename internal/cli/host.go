@@ -252,6 +252,7 @@ func cmdHostRun(args []string, stdout, stderr io.Writer, logger *log.Logger) int
 	fs := flag.NewFlagSet("host run", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	server := fs.String("server", "", "Only run the pairing with this server URL")
+	verbose := fs.Bool("verbose", false, "Log each delta's write shape and timing")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -302,7 +303,7 @@ func cmdHostRun(args []string, stdout, stderr io.Writer, logger *log.Logger) int
 		go func(p *config.HostPairing) {
 			defer wg.Done()
 			defer unlock()
-			code := runHostPairing(ctx, p, prefix, stdout, hostLogger)
+			code := runHostPairing(ctx, p, prefix, stdout, hostLogger, *verbose)
 			exitMu.Lock()
 			if code > exit {
 				exit = code
@@ -321,7 +322,7 @@ func cmdHostRun(args []string, stdout, stderr io.Writer, logger *log.Logger) int
 // runHostPairing runs one server's control-plane loop until cancel or a
 // permanent error. Other pairings keep running either way.
 func runHostPairing(ctx context.Context, pairing *config.HostPairing,
-	prefix string, stdout io.Writer, logger *log.Logger) int {
+	prefix string, stdout io.Writer, logger *log.Logger, verbose bool) int {
 	cfg := pairing.Config
 	// Re-check and report, never exit: a host that lost CREATEDB still syncs
 	// its already-claimed databases correctly (their ownership is intact);
@@ -340,6 +341,7 @@ func runHostPairing(ctx context.Context, pairing *config.HostPairing,
 		logger:    logger,
 		logPrefix: prefix,
 		stdout:    stdout,
+		verbose:   verbose,
 		children:  make(map[string]*managedChild),
 	}
 	logger.Printf("ee-database %s host %q connecting to %s", Version, cfg.HostName, cfg.ServerURL)
@@ -374,6 +376,7 @@ type hostRunner struct {
 	logger    *log.Logger
 	logPrefix string // "[slug] " when several pairings run in one process
 	stdout    io.Writer
+	verbose   bool // --verbose, handed to every managed child's apply log
 
 	mu       sync.Mutex
 	children map[string]*managedChild
@@ -580,7 +583,9 @@ func (r *hostRunner) ensure(reg framing.HostRegistration) {
 		return
 	}
 
-	t := &target{key: reg.DatabaseID, cfg: cfgP, refresh: refreshP, dsn: dsn}
+	t := &target{
+		key: reg.DatabaseID, cfg: cfgP, refresh: refreshP, dsn: dsn, verbose: r.verbose,
+	}
 	t.preflight = apply.Preflight(r.ctx, cfgP.Dialect, dsn, db)
 	fmt.Fprintf(r.stdout, "%sPreflight %s: %s\n", r.logPrefix, targetLabel(t), preflightSummary(t.preflight))
 	// Unconditional in host mode (the content-gated advisory stays too): the

@@ -29,7 +29,7 @@ const (
 
 // Version is the CLI release version — single source for the version command,
 // run banners and the wire agent identity below.
-const Version = "1.5.2"
+const Version = "1.6.0"
 
 // Agent identifies this client in User-Agent and hello frames.
 const Agent = "ee-database/" + Version
@@ -58,6 +58,28 @@ func (a *TrigramAdvisor) Check(sqlText string, logger *log.Logger) {
 		"extension is not installed — they are skipped (no-op) until a database owner " +
 		"runs 'CREATE EXTENSION pg_trgm;' on this replica; data and all other DDL " +
 		"apply normally, and the indexes materialize on the next publish or reconcile")
+}
+
+// Options are the per-target knobs Bootstrap and Pump share for one run.
+type Options struct {
+	// Trigram carries the once-per-target missing-pg_trgm advisory.
+	Trigram *TrigramAdvisor
+	// FailDump is where a failed snapshot script is written (empty: nowhere).
+	FailDump string
+	// Verbose adds the per-delta write shape and timing to the apply log.
+	// The batch-level shape line is printed either way.
+	Verbose bool
+}
+
+// summaryTables caps how many tables a non-verbose batch summary names; the
+// busiest win the line and the rest collapse into a count. Verbose lists all.
+const summaryTables = 6
+
+func (o Options) maxSummaryTables() int {
+	if o.Verbose {
+		return 0
+	}
+	return summaryTables
 }
 
 // PermanentError stops the reconnect loop (revoked credential, apply failure).
@@ -159,7 +181,7 @@ func (c *Conn) Close(code websocket.StatusCode, reason string) {
 // same revision-guarded statements.
 func Pump(ctx context.Context, conn *Conn, db *sql.DB, logger *log.Logger,
 	rebootstrap func(context.Context) error, bootstrapPending bool,
-	trigram *TrigramAdvisor) error {
+	opts Options) error {
 	// Keepalive: drives intermediate proxies; the server answers pong frames.
 	pingCtx, pingCancel := context.WithCancel(ctx)
 	defer pingCancel()
@@ -212,14 +234,19 @@ func Pump(ctx context.Context, conn *Conn, db *sql.DB, logger *log.Logger,
 			if len(f.Deltas) == 0 {
 				continue
 			}
-			logger.Printf("applying %d delta(s) (%d .. %d)",
+			// "in one transaction" is not decoration: the window IS the
+			// replica's transaction unit (the server never ends a window
+			// inside a batch_id), which is the grouping an operator sizing a
+			// re-enrichment has to know.
+			logger.Printf("applying %d delta(s) (%d .. %d) in one transaction",
 				len(f.Deltas), f.Deltas[0].ID, f.Deltas[len(f.Deltas)-1].ID)
 			for i := range f.Deltas {
-				trigram.Check(f.Deltas[i].SQL, logger)
+				opts.Trigram.Check(f.Deltas[i].SQL, logger)
 			}
-			lastID, failedID, err := apply.Batch(ctx, db, f.Deltas)
+			res, err := apply.Batch(ctx, db, f.Deltas, opts.Verbose)
 			if err != nil {
 				msg := err.Error()
+				failedID := res.FailedID
 				if failedID != nil {
 					for i := range f.Deltas {
 						if f.Deltas[i].ID == *failedID {
@@ -255,10 +282,20 @@ func Pump(ctx context.Context, conn *Conn, db *sql.DB, logger *log.Logger,
 				)
 				continue
 			}
-			if err := conn.Send(ctx, framing.Ack{Type: "ack", UpToID: lastID}); err != nil {
+			for _, d := range res.Deltas {
+				logger.Printf("  delta %d %s %s%s (%s) — %s", d.ID, d.Kind, d.Op,
+					entitySuffix(d.EntityType), roundedDuration(d.Elapsed),
+					d.Shape.Summary(0))
+			}
+			// The write shape, said once per window: an acked delta is gone
+			// server-side, so this log line is the only lasting record of what
+			// one enrichment costs this replica (issue #139).
+			logger.Printf("applied %d delta(s) in %s — %s", len(f.Deltas),
+				roundedDuration(res.Elapsed), res.Shape.Summary(opts.maxSummaryTables()))
+			if err := conn.Send(ctx, framing.Ack{Type: "ack", UpToID: res.LastID}); err != nil {
 				return err
 			}
-			logger.Printf("acked up to delta %d", lastID)
+			logger.Printf("acked up to delta %d", res.LastID)
 		case framing.Pong:
 			// Heartbeat reply; nothing to do.
 		default:
@@ -269,16 +306,19 @@ func Pump(ctx context.Context, conn *Conn, db *sql.DB, logger *log.Logger,
 
 // Bootstrap fetches and applies the snapshot over the credential. On apply
 // failure the database's full complaint is logged and the fetched script is
-// saved to failDump (when non-empty) so the failing statement can be
-// inspected; a later success removes the stale dump.
+// saved to opts.FailDump (when non-empty) so the failing statement can be
+// inspected; a later success removes the stale dump. Under opts.Verbose the
+// applied snapshot's own write shape is reported.
 func Bootstrap(ctx context.Context, client *auth.Client, accessToken string, db *sql.DB,
-	logger *log.Logger, failDump string, trigram *TrigramAdvisor) error {
+	logger *log.Logger, opts Options) error {
 	logger.Printf("bootstrapping: fetching snapshot…")
 	sqlText, cursor, err := client.FetchSnapshot(ctx, accessToken)
 	if err != nil {
 		return err
 	}
-	trigram.Check(sqlText, logger)
+	opts.Trigram.Check(sqlText, logger)
+	failDump := opts.FailDump
+	started := time.Now()
 	if err := apply.Snapshot(ctx, db, sqlText); err != nil {
 		logger.Printf("snapshot apply failed (nothing applied — single transaction):\n%s",
 			apply.DescribeError(sqlText, err))
@@ -296,6 +336,34 @@ func Bootstrap(ctx context.Context, client *auth.Client, accessToken string, db 
 	if failDump != "" {
 		_ = os.Remove(failDump) // evidence from an earlier failed attempt
 	}
+	if opts.Verbose {
+		// The snapshot is the delta from zero: its shape is the table
+		// inventory the replica starts from.
+		shape := apply.Summarize(sqlText)
+		logger.Printf("snapshot applied in %s — %s",
+			roundedDuration(time.Since(started)), shape.Summary(0))
+	}
 	logger.Printf("bootstrap complete (delta cursor %d)", cursor)
 	return nil
+}
+
+// entitySuffix renders the delta's entity type when the server named one.
+func entitySuffix(entityType string) string {
+	if entityType == "" {
+		return ""
+	}
+	return " " + entityType
+}
+
+// roundedDuration keeps apply timings readable at every scale a delta spans:
+// a one-statement DDL delta lands in microseconds and must not print as "0s".
+func roundedDuration(d time.Duration) time.Duration {
+	switch {
+	case d < time.Millisecond:
+		return d.Round(10 * time.Microsecond)
+	case d < time.Second:
+		return d.Round(time.Millisecond)
+	default:
+		return d.Round(10 * time.Millisecond)
+	}
 }

@@ -438,7 +438,7 @@ func TestHostControlLoopStartsARetargetedSyncOver(t *testing.T) {
 		if err != nil {
 			return
 		}
-		defer ws.CloseNow()
+		defer func() { _ = ws.CloseNow() }()
 		for { // hello, preflight — and never a frame back
 			if _, _, err := ws.Read(r.Context()); err != nil {
 				return
@@ -469,8 +469,7 @@ func TestHostControlLoopStartsARetargetedSyncOver(t *testing.T) {
 	for deadline := time.Now().Add(20 * time.Second); config.LoadProfileDSN("db-1") != want; {
 		if time.Now().After(deadline) {
 			cancel()
-			<-stopped
-			t.Fatalf("the registration was not claimed afresh\nlog: %s", logged.String())
+			t.Fatalf("the registration was not claimed afresh (control loop ended with %v)\nlog: %s", <-stopped, logged.String())
 		}
 		time.Sleep(10 * time.Millisecond)
 	}

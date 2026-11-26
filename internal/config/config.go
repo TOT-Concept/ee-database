@@ -48,6 +48,11 @@ type Config struct {
 	Dialect      string `json:"dialect,omitempty"`
 	ServerURL    string `json:"server_url"`
 	Bootstrapped bool   `json:"bootstrapped,omitempty"`
+	// TargetGeneration counts how many times the registration's target
+	// database was changed on the server, as of this pairing. A pairing made
+	// at another count belongs to another database: its saved DSN no longer
+	// names the target.
+	TargetGeneration int `json:"target_generation,omitempty"`
 }
 
 // Profile is one paired database: its directory key plus the loaded config.
@@ -249,6 +254,19 @@ func LoadProfileDSN(key string) string {
 		return ""
 	}
 	return string(raw)
+}
+
+// ClearProfileDSN forgets the profile's stored DSN, so the next run has to be
+// told where the target database is. No-op when none was saved.
+func ClearProfileDSN(key string) error {
+	p, err := ProfileDir(key)
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(filepath.Join(p, dsnFileName)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove saved dsn: %w", err)
+	}
+	return nil
 }
 
 // ErrNotPaired is returned by LoadProfile when the profile does not exist.

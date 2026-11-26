@@ -29,7 +29,7 @@ const (
 
 // Version is the CLI release version — single source for the version command,
 // run banners and the wire agent identity below.
-const Version = "1.6.0"
+const Version = "1.7.0"
 
 // Agent identifies this client in User-Agent and hello frames.
 const Agent = "ee-database/" + Version
@@ -62,6 +62,9 @@ func (a *TrigramAdvisor) Check(sqlText string, logger *log.Logger) {
 
 // Options are the per-target knobs Bootstrap and Pump share for one run.
 type Options struct {
+	// Driver is the target database type: it applies the snapshot and
+	// describes apply errors.
+	Driver apply.Driver
 	// Trigram carries the once-per-target missing-pg_trgm advisory.
 	Trigram *TrigramAdvisor
 	// FailDump is where a failed snapshot script is written (empty: nowhere).
@@ -250,7 +253,7 @@ func Pump(ctx context.Context, conn *Conn, db *sql.DB, logger *log.Logger,
 				if failedID != nil {
 					for i := range f.Deltas {
 						if f.Deltas[i].ID == *failedID {
-							msg = apply.DescribeError(f.Deltas[i].SQL, err)
+							msg = opts.Driver.DescribeError(f.Deltas[i].SQL, err)
 							break
 						}
 					}
@@ -305,10 +308,11 @@ func Pump(ctx context.Context, conn *Conn, db *sql.DB, logger *log.Logger,
 }
 
 // Bootstrap fetches and applies the snapshot over the credential. On apply
-// failure the database's full complaint is logged and the fetched script is
+// failure the database's full complaint is logged, the fetched script is
 // saved to opts.FailDump (when non-empty) so the failing statement can be
-// inspected; a later success removes the stale dump. Under opts.Verbose the
-// applied snapshot's own write shape is reported.
+// inspected, and the complaint is reported to the server, which shows it on
+// the Sync client card; a later success removes the stale dump. Under
+// opts.Verbose the applied snapshot's own write shape is reported.
 func Bootstrap(ctx context.Context, client *auth.Client, accessToken string, db *sql.DB,
 	logger *log.Logger, opts Options) error {
 	logger.Printf("bootstrapping: fetching snapshot…")
@@ -319,9 +323,9 @@ func Bootstrap(ctx context.Context, client *auth.Client, accessToken string, db 
 	opts.Trigram.Check(sqlText, logger)
 	failDump := opts.FailDump
 	started := time.Now()
-	if err := apply.Snapshot(ctx, db, sqlText); err != nil {
-		logger.Printf("snapshot apply failed (nothing applied — single transaction):\n%s",
-			apply.DescribeError(sqlText, err))
+	if err := opts.Driver.Snapshot(ctx, db, sqlText); err != nil {
+		described := opts.Driver.DescribeError(sqlText, err)
+		logger.Printf("snapshot apply failed (nothing applied — single transaction):\n%s", described)
 		if failDump != "" {
 			// The script only exists in this response — persist it (0600: it
 			// carries the org's entity data) or the error is undiagnosable.
@@ -329,6 +333,15 @@ func Bootstrap(ctx context.Context, client *auth.Client, accessToken string, db 
 				logger.Printf("could not save the failed snapshot: %v", werr)
 			} else {
 				logger.Printf("failed snapshot saved to %s", failDump)
+			}
+		}
+		// Without this the server knows nothing: a first bootstrap has no
+		// WebSocket to carry an apply_error frame, and the page would keep
+		// asking for a client that is in fact running. An interrupted run has
+		// nothing to report.
+		if ctx.Err() == nil {
+			if rerr := client.ReportApplyError(ctx, accessToken, "snapshot: "+described); rerr != nil {
+				logger.Printf("could not report the failed snapshot to the server: %v", rerr)
 			}
 		}
 		return fmt.Errorf("apply snapshot: %w", err)

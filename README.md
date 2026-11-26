@@ -8,9 +8,13 @@ over WSS (no inbound access, no credentials shared with Entity Enricher),
 receives delta batches, applies them and acknowledges:
 
 ```
-Entity Enricher ──WSS──▶ ee-database ──SQL──▶ your PostgreSQL / MySQL / SQLite
+Entity Enricher ──WSS──▶ ee-database ──SQL──▶ your PostgreSQL or SQL Server
         ◀──────ack───────┘
 ```
+
+The database type is chosen when the database sync is created in Entity
+Enricher: **PostgreSQL** or **SQL Server** (2022 or later). The client applies
+whichever the sync says — see [Target databases](#target-databases).
 
 - **Bootstrap included** — on first run it fetches the `.sql` snapshot (tables +
   current data) and applies it before consuming deltas.
@@ -49,7 +53,7 @@ no long-lived signing key anywhere.
 
 Alternatively, download a signed binary from
 [Releases](https://github.com/TOT-Concept/ee-database/releases) yourself,
-or build from source (Go ≥ 1.23):
+or build from source (Go ≥ 1.25):
 
 ```bash
 go build -o ee-database .
@@ -67,41 +71,68 @@ ln -sfn "$PWD/tmp/ee-database" ~/.local/bin/ee-database   # ensure ~/.local/bin 
 ## Quick start
 
 ```bash
-# 1. Pair with your Entity Enricher organization (opens the browser to pick the database)
+# 1. In Entity Enricher, on the Database Sync page: create a database sync on your
+#    schema, choose PostgreSQL or SQL Server, then publish the schema from its Model tab
+
+# 2. Pair this machine (opens the browser to pick that database sync)
 ee-database pair --server https://entityenricher.ai
 
-# 2. Run it next to your database
+# 3. Run it next to your database, with the DSN of the sync's type:
+#    PostgreSQL
 ee-database run --dsn "postgres://user:pass@localhost:5432/mydb" --save-dsn
+#    or SQL Server
+ee-database run --dsn "sqlserver://user:pass@localhost:1433?database=mydb" --save-dsn
 ```
+
+Run in a terminal without a DSN, `ee-database run` asks for its parts instead
+(host, port, user, hidden password, database) and tests the connection. When it
+fails, it says why and asks again for the parts at fault only: host and port
+when nothing answers, user and password when the login is refused, the database
+when it does not exist. Once connected, it offers to save the DSN.
 
 Alternatively, issue a token on the Databases page (Sync client → Pair a client)
 and paste it: `ee-database pair --server https://entityenricher.ai <refresh-token>`.
 
 If the target database does not exist yet, add `--create-missing` to the `run`
-command: the client creates it with the DSN's own credentials before syncing
-(postgres: needs `CREATEDB`, goes through the standard `postgres` maintenance
-database; mysql: needs the `CREATE` privilege; sqlite: unnecessary — the file
-is created automatically).
+command: the client creates it with the DSN's own credentials before syncing.
+The login then needs the server-level create right — `CREATEDB` on PostgreSQL
+(the client goes through the standard `postgres` maintenance database),
+`CREATE ANY DATABASE` on SQL Server (through `master`).
 
-When even the DSN's role/user does not exist yet, add `--admin-dsn` with an
+When even the DSN's login does not exist yet, add `--admin-dsn` with an
 administrative connection: the client then bootstraps everything the target
-DSN names — the role (with the target DSN's password, postgres) or user
-(mysql, plus a grant on the database) when missing, and the database owned by
-it. The target DSN needs no create rights of its own in this mode:
+DSN names — the login (with the target DSN's password) when missing, and the
+database, which it hands to that login (owner on PostgreSQL, `db_owner` member
+on SQL Server). The target DSN needs no create rights of its own in this mode:
 
 ```bash
 ee-database run \
   --dsn "postgres://ee_replica:secret@localhost:5432/my_replica" \
   --create-missing --admin-dsn "postgres://postgres:admin@localhost:5432/postgres"
+
+ee-database run \
+  --dsn "sqlserver://ee_replica:Secret_123@localhost:1433?database=my_replica" \
+  --create-missing --admin-dsn "sqlserver://sa:Admin_123@localhost:1433"
 ```
 
-The admin DSN is used only for this bootstrap — it is never stored.
+The admin DSN is used only for this bootstrap — it is never stored. On SQL
+Server the new login's password must pass the server's password policy; a
+refusal is reported in the server's own words. Also on SQL Server, a database
+that exists and in which the login has no user is opened to it the same way
+(a bootstrap that was interrupted is finished by running it again); a user
+that exists keeps the rights it has.
 
 On every run the client self-checks its login's provisioning rights — create
 database (from the catalog), DDL and DML (a create/insert/delete/drop probe
 table) — prints the result and reports it to the Databases page's Sync client
-card, so a missing grant is visible there before deltas fail to apply. The
-check is advisory: it never blocks the run.
+card, so a missing grant is visible there before deltas fail to apply. On SQL
+Server it also checks the version and the database compatibility level
+(see [Target databases](#target-databases)); an older target is reported as
+unable to apply DDL. The check is advisory: it never blocks the run.
+
+If none of the database's linked schemas is published yet, the first run has
+nothing to bootstrap: the client stays connected and waits, and the first
+publish starts the feed on its own — no restart needed.
 
 ### Required database rights (PostgreSQL)
 
@@ -132,12 +163,27 @@ checks for it and, when the login is allowed to, installs it itself
 in full — the search-index statements are self-guarded and simply no-op — and a
 warning explains the one-time fix: have a database owner run
 `CREATE EXTENSION pg_trgm;` on the replica. The indexes then materialize on the
-next publish or reconcile. MySQL and SQLite replicas never receive search-index
-statements.
+next publish or reconcile.
 
-If none of the database's linked schemas is published yet, the first run has
-nothing to bootstrap: the client stays connected and waits, and the first
-publish starts the feed on its own — no restart needed.
+### Required database rights (SQL Server)
+
+Assuming the target database already exists, the login needs a user in it that
+is a member of `db_owner` — what `--create-missing --admin-dsn` sets up:
+
+```sql
+CREATE LOGIN [ee_replica] WITH PASSWORD = N'Secret_123';  -- once, if the login does not exist
+USE [my_replica];                                         -- the target database
+CREATE USER [ee_replica] FOR LOGIN [ee_replica];
+ALTER ROLE db_owner ADD MEMBER [ee_replica];
+```
+
+For `--create-missing` without `--admin-dsn`:
+`USE master; GRANT CREATE ANY DATABASE TO [ee_replica];`
+
+The feed creates and alters tables, indexes and constraints, so read and write
+grants alone are not enough. SQL Server replicas need no extension: it has no
+trigram index, so the substring-search indexes are not created there (Entity
+Enricher says so when the sync is created).
 
 ## Reading the apply log
 
@@ -154,9 +200,11 @@ acked up to delta 10842
 Read it as the write shape of the feed, which is what sizing a nightly
 re-enrichment needs:
 
-- **upsert** — one `INSERT … ON CONFLICT DO UPDATE` per projected row, so the
-  count *is* the row count. Children are reconciled **in place**; they are
-  never wiped and re-inserted.
+- **upsert** — one `INSERT … ON CONFLICT DO UPDATE` (PostgreSQL) or one `MERGE`
+  (SQL Server) per projected row, so the count *is* the row count — except that
+  on SQL Server the rows of one list or junction share one `MERGE` per 1000
+  rows. Children are reconciled **in place**; they are never wiped and
+  re-inserted.
 - **prune** — a revision-guarded `DELETE` removing the child or junction rows
   the new payload no longer claims. One statement per relationship, however
   many rows it clears.
@@ -164,7 +212,8 @@ re-enrichment needs:
 - **wipe** — an unscoped `DELETE`; only a keyless parent's children are
   replaced wholesale.
 - **ddl** — schema deltas: table, column and index statements, including the
-  ones the feed guards inside a `DO` block.
+  ones the feed guards inside a `DO` block (PostgreSQL) or an `EXEC(…)`
+  (SQL Server).
 
 `--verbose` adds one line per delta, with its id, kind, entity type, wall time
 and its own shape — the per-entity cost, which is otherwise unrecoverable once
@@ -185,11 +234,11 @@ It also reports the bootstrap snapshot's table inventory and apply time.
 | `pair --server URL` | Browser-confirmed device-code pairing |
 | `pair --server URL <token>` | Pair with a token from the Databases page |
 | `run --dsn DSN [--save-dsn] [--skip-bootstrap]` | Connect and apply deltas |
-| `run … --create-missing` | Create the target database first when it does not exist (postgres/mysql; sqlite files are created anyway) |
-| `run … --create-missing --admin-dsn DSN` | Also create the target DSN's missing role/user via an admin connection (never stored) |
+| `run … --create-missing` | Create the target database first when it does not exist |
+| `run … --create-missing --admin-dsn DSN` | Also create the target DSN's missing login via an admin connection (never stored) |
 | `run --all` | Sync every paired database concurrently (each needs a saved DSN) |
 | `run … --verbose` / `host run … --verbose` | Log every delta's write shape and timing, not just the per-window summary |
-| `host pair --server URL --dsn BASE_DSN [--admin-dsn DSN] <token>` | Pair this machine as a managed sync host (token from the Sync hosts dialog — the "Sync hosts" toolbar button on the Database Sync page); one pairing per server, so several backends can be paired side by side |
+| `host pair --server URL --dsn BASE_DSN [--admin-dsn DSN] <token>` | Pair this machine as a managed sync host (token from the Sync hosts dialog — the "Sync hosts" toolbar button on the Database Sync page); one pairing per server, so several backends can be paired side by side. The base DSN's scheme (`postgres://` or `sqlserver://`) is the database type the host serves |
 | `host run [--server URL]` | Managed mode: auto-claim, create and sync every database sync assigned to this host — every paired server at once, or one with `--server` |
 | `host status` / `host disconnect [--server URL]` | Show / forget host pairings (`--server` picks one when several servers are paired) |
 | `status` | Show pairing state (all paired databases) |
@@ -223,13 +272,34 @@ ee-database host pair --server https://entityenricher.ai \
 ee-database host run
 ```
 
+A SQL Server host is paired with a `sqlserver://` base DSN, without the
+`database` parameter:
+
+```bash
+ee-database host pair --server https://entityenricher.ai \
+  --dsn "sqlserver://ee_replica:Secret_123@dbserver:1433" \
+  --admin-dsn "sqlserver://sa:Admin_123@dbserver:1433" <token>
+```
+
 `--admin-dsn` plays the same role as on `run --create-missing`: provisioning
-creates the target role and each claimed database through the admin
+creates the target login and each claimed database through the admin
 connection, so the base DSN's login needs no create rights of its own. It is
-used at provision time only — never stored. Without it, pairing preflights the
-base DSN's own rights and fails fast on a missing `CREATEDB`
-(`--skip-preflight` to override; `host run` re-checks and reports to the Sync
-hosts card either way).
+stored on this machine only (mode 0600) and never sent to Entity Enricher.
+Pairing preflights the rights of the login that will create the databases —
+the admin DSN's when given, else the base DSN's own — and fails fast when it
+may not, quoting the statement that grants the right (`--skip-preflight` to
+override; `host run` re-checks and reports to the Sync hosts card either way).
+A base DSN that is not a `postgres://` or `sqlserver://` URL is refused before
+the token is used.
+
+**One database type per pairing.** A host pairing serves the database type of
+its base DSN, and a machine holds one pairing per Entity Enricher server. A
+database sync of the other type assigned to the host is skipped with a log
+line (Entity Enricher only auto-assigns syncs of the host's type). Pairing the
+same server again with the other type is refused until
+`ee-database host disconnect --server URL` forgets the first pairing: to serve
+both types for one server, pair a second machine, or a second user account on
+the same one.
 
 ## Multiple databases
 
@@ -257,22 +327,86 @@ same time (they would evict each other's WebSocket session in a loop).
 Pairings made with ee-database ≤ 0.1.x are migrated into a profile
 automatically on first use.
 
-## Dialects
+## Target databases
 
-The target dialect is fixed by the schema database registration in Entity
-Enricher. PostgreSQL is the launch dialect; the MySQL and SQLite drivers are
-already bundled for when their SQL renderers ship.
+The target database type belongs to the database sync in Entity Enricher; the
+client reads it when pairing and applies that type's SQL.
+
+| Type | DSN | Requires |
+|---|---|---|
+| PostgreSQL (`postgres`) | `postgres://user:pass@host:5432/database` | |
+| SQL Server (`sqlserver`) | `sqlserver://user:pass@host:1433?database=database` | SQL Server 2022 or later, database compatibility level 130 or more. The version check also accepts Azure SQL Database and Azure SQL Managed Instance, which are not tested |
+
+What a SQL Server replica stores and constrains differently (400-character keys
+and indexed text, exact text comparison, language columns, …) is described on
+the [Database Sync page](https://entityenricher.ai/docs/database-sync). Index
+names starting with `idx_` or `uq_` are reserved for the sync: a migration may
+drop an index with such a name, so give yours another prefix.
+
+A SQL Server DSN must be this URL form (ADO and ODBC connection strings are
+refused), with the database in the `database` parameter. A DSN that names no
+database is refused — the server would open the login's default database,
+usually `master` — and a path after the host (`sqlserver://host/name`) is an
+instance name, not a database. The other parameters
+of [go-mssqldb](https://github.com/microsoft/go-mssqldb#connection-parameters-and-dsn)
+pass through. Without an `encrypt` parameter only the login is encrypted and the
+certificate is not checked. Add `&encrypt=true` to encrypt the connection and
+check the certificate; with a self-signed certificate, add
+`&TrustServerCertificate=true` as well.
+
+The user and the password are parts of a URL, on both types: percent-encode
+`#`, `/`, `?`, `%` and `@` in them (`#` is `%23`, `/` is `%2F`, `?` is `%3F`,
+`%` is `%25`, `@` is `%40`).
+
+### When the target database of a sync changes
+
+"Change target database" in Entity Enricher points a sync at another database,
+of the same type or the other one, and restarts it there from a snapshot. It
+revokes the client's credential, so nothing more is written to the previous
+database, which is left as it is.
+
+- **Paired client** — `run` stops and asks to pair again. Pairing again
+  discards the saved DSN, which names the previous database, and says so:
+  pass the new database's `--dsn` (with `--save-dsn`) on the next run.
+- **Managed host** — nothing to do: the host claims the sync again and creates
+  a new database for it, named after the sync plus the number of changes
+  (`films`, then `films__1`). A `database_names` override in the host
+  `config.json` still wins over that name: change it too if the new target
+  must be another database. A sync changed to the other database type leaves
+  this host, which serves one type: in Entity Enricher it is assigned to a
+  host of the new type.
+
+A sync whose target was changed, and any SQL Server sync, needs ee-database
+1.7.0 or later. `ee-database version` prints the installed version; running the
+[install command](#install) again replaces it with the latest. An older client
+is refused with a message that names the version to install, or stops on
+`unsupported dialect "sqlserver"`.
 
 ## Troubleshooting a failed apply
 
 When the target database rejects the snapshot or a delta, ee-database prints
-everything the database reported — SQLSTATE, detail, hint, and (when the
-server provides an error cursor) the offending script line. A failed snapshot
-is additionally saved to the pairing's profile directory as
-`snapshot-failed.sql` (mode 0600, replaced on each attempt, removed on the
-next success), so the failing statement can be inspected or replayed with
-`psql -f`. Nothing is partially applied: the snapshot is one transaction, and
-a failed delta batch rolls back and is redelivered once the cause is fixed.
+everything the database reported — on PostgreSQL the SQLSTATE, detail and
+hint, on SQL Server the error number and state — and, when the database
+located the error, the offending script line. The same text is sent to Entity
+Enricher, which shows it on the Sync client card. A failed snapshot is
+additionally saved to the pairing's profile directory as `snapshot-failed.sql`
+(mode 0600, replaced on each attempt, removed on the next success), so the
+failing statement can be inspected or replayed:
+
+```bash
+psql "$DSN" -v ON_ERROR_STOP=1 -f snapshot-failed.sql                     # PostgreSQL
+sqlcmd -S host,1433 -d database -U user -I -b -x -i snapshot-failed.sql   # SQL Server
+```
+
+A SQL Server snapshot is a `sqlcmd` script: batches separated by `GO` lines,
+which the client sends one by one over a single connection. `-I` turns quoted
+identifiers on, `-b` stops at the first error and `-x` keeps `sqlcmd` from
+reading `$(…)` in a value as one of its variables. `-d` names the target
+database: without it `sqlcmd` writes to the login's default database, usually
+`master`. Add `-C` when the server's certificate is self-signed.
+
+Nothing is partially applied: the snapshot is one transaction, and a failed
+delta batch rolls back and is quarantined until you reinject it.
 
 ## Security model
 

@@ -2,28 +2,20 @@ package apply
 
 import (
 	"context"
-	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
 
 	"github.com/TOT-Concept/ee-database/internal/framing"
 )
 
-// Batch's report is what the apply log states about a window; run it against a
-// real (sqlite) database so the shape roll-up, the cursor and the failure path
-// are proven together rather than by inspection.
+// Batch's report is what the apply log states about a window: the shape
+// roll-up, the cursor and the transaction around the deltas are proven
+// together on the recording driver (the rollback itself is proven against a
+// real database in the live tests).
 func TestBatchReportsTheWriteShape(t *testing.T) {
-	db, err := Open("sqlite", filepath.Join(t.TempDir(), "replica.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
+	db, fake := openFake(t)
 	ctx := context.Background()
-	if _, err := db.ExecContext(ctx, `
-CREATE TABLE "album" ("k" TEXT PRIMARY KEY, "_sync_revision" INTEGER);
-CREATE TABLE "track" ("_album_k" TEXT, "k" TEXT, "_sync_revision" INTEGER,
-                      PRIMARY KEY ("_album_k", "k"));`); err != nil {
-		t.Fatal(err)
-	}
 
 	entityType := "Album"
 	deltas := []framing.Delta{{
@@ -42,6 +34,11 @@ AND "_sync_revision" < 7;`,
 	res, err := Batch(ctx, db, deltas, true)
 	if err != nil {
 		t.Fatalf("apply: %v", err)
+	}
+	// One window = one transaction, one Exec per delta (its whole script).
+	want := []string{"BEGIN", deltas[0].SQL, deltas[1].SQL, "COMMIT"}
+	if got := fake.sent(); !slices.Equal(got, want) {
+		t.Fatalf("sent to the database:\n%q\nwant:\n%q", got, want)
 	}
 	if res.LastID != 42 || res.FailedID != nil {
 		t.Fatalf("cursor = %d / failed = %v", res.LastID, res.FailedID)
@@ -66,7 +63,7 @@ AND "_sync_revision" < 7;`,
 	// only lasting record once the deltas are acked and purged.
 	res, err = Batch(ctx, db, deltas, false)
 	if err != nil {
-		t.Fatalf("re-apply (idempotent): %v", err)
+		t.Fatalf("re-apply: %v", err)
 	}
 	if len(res.Deltas) != 0 || res.Shape.Statements != 4 {
 		t.Fatalf("quiet mode: %d detail entries, %d statements", len(res.Deltas), res.Shape.Statements)
@@ -74,30 +71,26 @@ AND "_sync_revision" < 7;`,
 }
 
 func TestBatchRollsBackAndNamesTheFailingDelta(t *testing.T) {
-	db, err := Open("sqlite", filepath.Join(t.TempDir(), "replica.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	ctx := context.Background()
-	if _, err := db.ExecContext(ctx, `CREATE TABLE "album" ("k" TEXT PRIMARY KEY);`); err != nil {
-		t.Fatal(err)
-	}
-	res, err := Batch(ctx, db, []framing.Delta{
+	db, fake := openFake(t)
+	fake.failOn = `"nope"`
+	deltas := []framing.Delta{
 		{ID: 1, Kind: "data", Op: "upsert", SQL: `INSERT INTO "album" ("k") VALUES ('a');`},
 		{ID: 2, Kind: "data", Op: "upsert", SQL: `INSERT INTO "nope" ("k") VALUES ('b');`},
-	}, false)
+		{ID: 3, Kind: "data", Op: "upsert", SQL: `INSERT INTO "album" ("k") VALUES ('c');`},
+	}
+	res, err := Batch(context.Background(), db, deltas, false)
 	if err == nil {
-		t.Fatal("expected the missing table to fail the batch")
+		t.Fatal("expected the refused statement to fail the batch")
+	}
+	if !strings.HasPrefix(err.Error(), "delta 2 (data upsert): ") {
+		t.Fatalf("error does not name the delta: %v", err)
 	}
 	if res.FailedID == nil || *res.FailedID != 2 {
 		t.Fatalf("failed delta = %v, want 2", res.FailedID)
 	}
-	var n int
-	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM "album"`).Scan(&n); err != nil {
-		t.Fatal(err)
-	}
-	if n != 0 {
-		t.Fatalf("rollback left %d row(s) behind", n)
+	// Nothing after the failure is sent, and the window is rolled back whole.
+	want := []string{"BEGIN", deltas[0].SQL, deltas[1].SQL, "ROLLBACK"}
+	if got := fake.sent(); !slices.Equal(got, want) {
+		t.Fatalf("sent to the database:\n%q\nwant:\n%q", got, want)
 	}
 }

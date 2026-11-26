@@ -14,11 +14,16 @@ package apply
 // mis-parsed statement costs a wrong log word, never a wrong write. That is
 // what makes a hand-rolled scanner acceptable here instead of a SQL parser.
 //
-// Statement counts are exact row counts for the writes that matter: the
-// renderer emits one single-row `INSERT … ON CONFLICT DO UPDATE` per projected
-// row. A reconciliation DELETE is counted as one statement — how many rows it
+// On PostgreSQL the upsert count is a row count: the renderer emits one
+// `INSERT … ON CONFLICT DO UPDATE` per projected row. On SQL Server the rows
+// of one list or junction share a `MERGE` (up to 1000 rows each), counted as
+// one. A reconciliation DELETE is counted as one statement — how many rows it
 // actually prunes is by construction "whatever no longer belongs", which only
 // the replica knows.
+//
+// One scanner reads both dialects: the T-SQL forms it knows (`[name]`, N'…',
+// MERGE, a leading IF, EXEC(N'…'), GO lines) cannot be mistaken for anything
+// the PostgreSQL renderer writes.
 
 import (
 	"fmt"
@@ -30,7 +35,7 @@ import (
 type opKind int
 
 const (
-	opUpsert opKind = iota // INSERT … ON CONFLICT/ON DUPLICATE KEY — one row
+	opUpsert opKind = iota // INSERT … ON CONFLICT (one row), MERGE (one or more)
 	opInsert               // plain INSERT — one row
 	opUpdate               // UPDATE
 	opPrune                // DELETE guarded by _sync_revision — reconciliation
@@ -183,19 +188,37 @@ func (s *Shape) Summary(maxTables int) string {
 func Summarize(sqlText string) Shape {
 	var s Shape
 	for _, stmt := range splitStatements(sqlText) {
+		if sessionSetup(stmt) {
+			continue
+		}
 		kind, table := classify(stmt)
 		s.add(table, kind)
 	}
 	return s
 }
 
+// sessionSetup reports a statement that writes nothing and opens every T-SQL
+// unit the server renders — `SET XACT_ABORT ON`, `SET QUOTED_IDENTIFIER ON`,
+// the snapshot's `EXEC sp_set_session_context …` step counter. Counting them
+// would add the same constant to every delta's statement count.
+func sessionSetup(stmt string) bool {
+	w := words(stmt, 4)
+	switch {
+	case len(w) == 3 && strings.EqualFold(w[0], "SET"):
+		return strings.EqualFold(w[2], "ON") || strings.EqualFold(w[2], "OFF")
+	case len(w) >= 2 && strings.EqualFold(w[0], "EXEC"):
+		return strings.EqualFold(w[1], "sp_set_session_context")
+	}
+	return false
+}
+
 // === scanning ================================================================
 
-// splitStatements cuts a script on top-level semicolons, stepping over string
-// literals, quoted identifiers, dollar-quoted bodies and comments. Backslash
-// is NOT an escape inside a literal: PostgreSQL's standard_conforming_strings
-// is on and it renders the only dialect that ships today. Reporting-only, so
-// a MySQL literal ending in a backslash costs at most a split log line.
+// splitStatements cuts a script on top-level semicolons and on GO lines (the
+// batch separator of a SQL Server snapshot), stepping over string literals,
+// quoted identifiers, dollar-quoted bodies and comments. Backslash is NOT an
+// escape inside a literal (PostgreSQL's standard_conforming_strings is on,
+// and T-SQL has no such escape).
 func splitStatements(sqlText string) []string {
 	var out []string
 	start := 0
@@ -207,8 +230,21 @@ func splitStatements(sqlText string) []string {
 		}
 	}
 	for i < n {
+		if i == 0 || sqlText[i-1] == '\n' {
+			// Outside a literal, a line holding only GO ends the statement.
+			eol := n
+			if j := strings.IndexByte(sqlText[i:], '\n'); j >= 0 {
+				eol = i + j
+			}
+			if isGoLine(sqlText[i:eol]) {
+				emit(i)
+				i = min(eol+1, n)
+				start = i
+				continue
+			}
+		}
 		switch c := sqlText[i]; {
-		case c == '\'', c == '"', c == '`':
+		case c == '\'', c == '"':
 			i = skipQuoted(sqlText, i, c)
 		case c == '$':
 			i = skipDollar(sqlText, i)
@@ -313,15 +349,18 @@ func classify(stmt string) (opKind, string) {
 }
 
 // actionKeywords are the statement heads worth reporting; anything else is
-// scaffolding (BEGIN, IF … THEN, EXCEPTION) or noise (SET, COMMENT).
+// scaffolding (BEGIN, IF … THEN, EXCEPTION, DECLARE) or noise (SET, COMMENT).
+// EXEC is the T-SQL word only: PL/pgSQL spells its dynamic SQL EXECUTE, which
+// stays scaffolding.
 var actionKeywords = map[string]bool{
-	"INSERT": true, "DELETE": true, "UPDATE": true,
-	"CREATE": true, "ALTER": true, "DROP": true,
+	"INSERT": true, "DELETE": true, "UPDATE": true, "MERGE": true,
+	"CREATE": true, "ALTER": true, "DROP": true, "EXEC": true,
 }
 
 // classifyDepth classifies one statement, stepping INTO the guarded DDL blocks
-// the projection emits (`DO $ee_mig$ BEGIN ALTER TABLE … EXCEPTION … END`).
-// The block stays one statement — reporting the ALTER it guards is the whole
+// the projection emits (`DO $ee_mig$ BEGIN ALTER TABLE … EXCEPTION … END` for
+// PostgreSQL, `EXEC(N'IF … RETURN; … ALTER TABLE …')` for SQL Server). The
+// block stays one statement — reporting the ALTER it guards is the whole
 // point of the line.
 func classifyDepth(stmt string, depth int) (opKind, string) {
 	// 12 tokens is the widest prefix a target can hide behind:
@@ -330,8 +369,9 @@ func classifyDepth(stmt string, depth int) (opKind, string) {
 	if len(w) == 0 {
 		return opOther, ""
 	}
-	if depth > 0 && !actionKeywords[strings.ToUpper(w[0])] {
-		// Inside a block: skip the PL/pgSQL scaffolding to the guarded action.
+	if (depth > 0 || strings.EqualFold(w[0], "IF")) && !actionKeywords[strings.ToUpper(w[0])] {
+		// Inside a block, or behind a T-SQL guard (`IF OBJECT_ID(…) IS NULL
+		// CREATE TABLE …`): skip the scaffolding to the guarded action.
 		all := words(stmt, 0)
 		for i, tok := range all {
 			if actionKeywords[strings.ToUpper(tok)] {
@@ -341,8 +381,12 @@ func classifyDepth(stmt string, depth int) (opKind, string) {
 		}
 	}
 	upper := strings.ToUpper(w[0])
-	if upper == "DO" && depth < 2 {
-		for _, inner := range splitStatements(dollarBody(stmt)) {
+	if (upper == "DO" || upper == "EXEC") && depth < 2 {
+		body := dollarBody(stmt)
+		if upper == "EXEC" {
+			body = execBody(stmt)
+		}
+		for _, inner := range splitStatements(body) {
 			if kind, table := classifyDepth(inner, depth+1); kind != opOther {
 				return kind, table
 			}
@@ -352,13 +396,14 @@ func classifyDepth(stmt string, depth int) (opKind, string) {
 	switch upper {
 	case "INSERT":
 		table := after(w, "INTO")
-		body := strings.ToUpper(stmt)
-		if strings.Contains(body, "ON CONFLICT") || strings.Contains(body, "ON DUPLICATE KEY") {
+		if strings.Contains(strings.ToUpper(stmt), "ON CONFLICT") {
 			return opUpsert, table
 		}
 		return opInsert, table
+	case "MERGE":
+		return opUpsert, after(w, "INTO")
 	case "DELETE":
-		table := after(w, "FROM")
+		table := writeTarget(stmt, afterRaw(w, "FROM"))
 		switch {
 		case !hasWord(stmt, "WHERE"):
 			// Only a keyless parent's children are replaced wholesale.
@@ -371,7 +416,10 @@ func classifyDepth(stmt string, depth int) (opKind, string) {
 			return opDelete, table
 		}
 	case "UPDATE":
-		return opUpdate, ident(w[1])
+		if len(w) < 2 {
+			return opUpdate, ""
+		}
+		return opUpdate, writeTarget(stmt, w[1])
 	case "CREATE", "ALTER", "DROP":
 		return opDDL, ddlTarget(w)
 	default:
@@ -393,6 +441,11 @@ func ddlTarget(w []string) string {
 // after returns the identifier following the given keyword, skipping the
 // noise words that may sit between (IF NOT EXISTS, CONCURRENTLY, ONLY…).
 func after(w []string, keyword string) string {
+	return ident(afterRaw(w, keyword))
+}
+
+// afterRaw is after with the identifier as it is written, quoting included.
+func afterRaw(w []string, keyword string) string {
 	for i, tok := range w {
 		if !strings.EqualFold(tok, keyword) {
 			continue
@@ -402,8 +455,62 @@ func after(w []string, keyword string) string {
 			case "IF", "NOT", "EXISTS", "ONLY", "CONCURRENTLY":
 				continue
 			}
-			return ident(w[j])
+			return w[j]
 		}
+	}
+	return ""
+}
+
+// writeTarget names the table an UPDATE or a DELETE writes. T-SQL lets them
+// name an alias (`UPDATE r SET … FROM [note] AS r`, `DELETE r FROM [links] AS
+// r`) or a CTE (`WITH s AS (SELECT … FROM [t]) DELETE FROM s`): a bare target
+// is looked up, and reported as it is when the statement declares no such
+// alias. The renderers always quote a table name, so a quoted target is one.
+func writeTarget(stmt, target string) string {
+	if target == "" || strings.ContainsAny(target, `"[.`) {
+		return ident(target)
+	}
+	all := words(stmt, 0)
+	for i := 2; i < len(all); i++ {
+		switch {
+		case strings.EqualFold(all[i], target) && strings.EqualFold(all[i-1], "AS") && i >= 3 &&
+			(strings.EqualFold(all[i-3], "FROM") || strings.EqualFold(all[i-3], "JOIN")):
+			return ident(all[i-2])
+		case strings.EqualFold(all[i], "AS") && strings.EqualFold(all[i-1], target) &&
+			strings.EqualFold(all[i-2], "WITH"):
+			return after(all[i:], "FROM")
+		}
+	}
+	return target
+}
+
+// execBody returns the script a statement's first `EXEC(N'…')` runs, quotes
+// un-doubled, or "" when its EXEC runs something else (a procedure, a
+// variable).
+func execBody(stmt string) string {
+	skipSpace := func(i int) int {
+		for i < len(stmt) && strings.IndexByte(" \t\r\n", stmt[i]) >= 0 {
+			i++
+		}
+		return i
+	}
+	for _, t := range tokens(stmt, 0) {
+		if !strings.EqualFold(t.text, "EXEC") {
+			continue
+		}
+		i := skipSpace(t.pos + len(t.text))
+		if i >= len(stmt) || stmt[i] != '(' {
+			return ""
+		}
+		i = skipSpace(i + 1)
+		if i < len(stmt) && (stmt[i] == 'N' || stmt[i] == 'n') {
+			i++
+		}
+		if i >= len(stmt) || stmt[i] != '\'' {
+			return ""
+		}
+		body := strings.TrimSuffix(stmt[i+1:skipQuoted(stmt, i, '\'')], "'")
+		return strings.ReplaceAll(body, "''", "'")
 	}
 	return ""
 }
@@ -421,9 +528,24 @@ func hasWord(stmt, keyword string) bool {
 
 // words tokenizes a statement outside literals and comments, stopping after
 // max tokens (0 = all). Quoted identifiers survive as one token, quotes
-// included, so `"my table"` does not split.
+// included, so `"my table"` and `[my table]` do not split.
 func words(stmt string, max int) []string {
-	var out []string
+	toks := tokens(stmt, max)
+	out := make([]string, len(toks))
+	for i, t := range toks {
+		out[i] = t.text
+	}
+	return out
+}
+
+// token is one word of a statement and where it starts.
+type token struct {
+	text string
+	pos  int
+}
+
+func tokens(stmt string, max int) []token {
+	var out []token
 	i, n := 0, len(stmt)
 	for i < n {
 		c := stmt[i]
@@ -431,16 +553,19 @@ func words(stmt string, max int) []string {
 		case c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == ',' || c == '(' || c == ')':
 			i++
 		case c == '\'':
+			out = append(out, token{"''", i}) // literal placeholder: never a keyword
 			i = skipQuoted(stmt, i, '\'')
-			out = append(out, "''") // literal placeholder: never a keyword
-		case c == '"' || c == '`':
-			j := skipQuoted(stmt, i, c)
-			out = append(out, stmt[i:j])
+		case (c == 'N' || c == 'n') && i+1 < n && stmt[i+1] == '\'':
+			out = append(out, token{"''", i}) // T-SQL national literal N'…'
+			i = skipQuoted(stmt, i+1, '\'')
+		case c == '"':
+			j := skipQuoted(stmt, i, '"')
+			out = append(out, token{stmt[i:j], i})
 			i = j
 		case c == '$':
 			j := skipDollar(stmt, i)
 			if j > i+1 {
-				out = append(out, "''")
+				out = append(out, token{"''", i})
 			}
 			i = j
 		case c == '-' && i+1 < n && stmt[i+1] == '-':
@@ -454,9 +579,17 @@ func words(stmt string, max int) []string {
 		default:
 			j := i
 			for j < n && !strings.ContainsRune(" \t\n\r,()", rune(stmt[j])) {
+				// A T-SQL bracket name is one piece of the token wherever it
+				// opens a name — at the token's start or after a qualifier dot
+				// (`[dbo].[my table]`, `t.[k]`). Anywhere else `[` is an
+				// ordinary character: PostgreSQL writes `ARRAY['a']::text[]`.
+				if stmt[j] == '[' && (j == i || stmt[j-1] == '.') {
+					j = skipBracket(stmt, j)
+					continue
+				}
 				j++
 			}
-			out = append(out, stmt[i:j])
+			out = append(out, token{stmt[i:j], i})
 			i = j
 		}
 		if max > 0 && len(out) >= max {
@@ -466,16 +599,41 @@ func words(stmt string, max int) []string {
 	return out
 }
 
+// skipBracket returns the index just past the T-SQL bracket name opening at i
+// (`]]` is an escaped bracket), or i+1 when nothing closes it.
+func skipBracket(s string, i int) int {
+	for j := i + 1; j < len(s); j++ {
+		if s[j] != ']' {
+			continue
+		}
+		if j+1 < len(s) && s[j+1] == ']' {
+			j++
+			continue
+		}
+		return j + 1
+	}
+	return i + 1
+}
+
 // ident strips quoting and any schema qualifier: the operator reads table
 // names, not physical addresses.
 func ident(tok string) string {
-	quoted := len(tok) > 1 &&
-		(tok[0] == '"' && tok[len(tok)-1] == '"' || tok[0] == '`' && tok[len(tok)-1] == '`')
-	if !quoted {
-		// A qualifier dot inside quotes ("my.table") is part of the name.
-		if i := strings.LastIndexByte(tok, '.'); i >= 0 && i < len(tok)-1 {
-			tok = tok[i+1:]
+	// A qualifier dot inside quotes ("my.table", [my.table]) is part of the
+	// name: only a dot between the parts cuts.
+	last := 0
+	for i := 0; i < len(tok); i++ {
+		switch {
+		case tok[i] == '"':
+			i = skipQuoted(tok, i, '"') - 1
+		case tok[i] == '[' && i == last:
+			i = skipBracket(tok, i) - 1
+		case tok[i] == '.' && i < len(tok)-1:
+			last = i + 1
 		}
 	}
-	return strings.Trim(tok, "\"`")
+	tok = tok[last:]
+	if len(tok) > 1 && tok[0] == '[' && tok[len(tok)-1] == ']' {
+		return strings.ReplaceAll(tok[1:len(tok)-1], "]]", "]")
+	}
+	return strings.Trim(tok, `"`)
 }

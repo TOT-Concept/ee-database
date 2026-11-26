@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // ErrPublishRequired marks the snapshot 409 sent while the database has linked
@@ -22,18 +23,49 @@ import (
 // failure and polling.
 var ErrPublishRequired = errors.New("no linked schema is published yet")
 
+// ErrUpgradeRequired marks the 426 the exchange and the claim answer when the
+// registration needs a newer ee-database than this one. Its text is the
+// server's own sentence: which version, and where to download it.
+type ErrUpgradeRequired struct{ Detail string }
+
+func (e ErrUpgradeRequired) Error() string { return e.Detail }
+
+// upgradeRequired reads the 426 body: {"detail": {"code":
+// "client_upgrade_required", "minimum": "1.7.0", "detail": "<sentence>"}}.
+func upgradeRequired(body []byte) error {
+	var parsed struct {
+		Detail struct {
+			Detail string `json:"detail"`
+		} `json:"detail"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil || parsed.Detail.Detail == "" {
+		return ErrUpgradeRequired{Detail: "the server requires a newer ee-database: " +
+			strings.TrimSpace(string(body))}
+	}
+	return ErrUpgradeRequired{Detail: parsed.Detail.Detail}
+}
+
 // Client talks to /api/database-sync/* endpoints on the Entity Enricher server.
 type Client struct {
-	BaseURL string // e.g. https://entityenricher.ai or http://localhost:18808
-	HTTP    *http.Client
+	BaseURL   string // e.g. https://entityenricher.ai or http://localhost:18808
+	UserAgent string // "ee-database/<version>"
+	HTTP      *http.Client
 }
 
 // New constructs a Client. ws:// and wss:// inputs are rewritten to http(s).
-func New(baseURL string) *Client {
+func New(baseURL, userAgent string) *Client {
 	return &Client{
-		BaseURL: normalizeBaseURL(baseURL),
-		HTTP:    &http.Client{Timeout: 60 * time.Second},
+		BaseURL:   normalizeBaseURL(baseURL),
+		UserAgent: userAgent,
+		HTTP:      &http.Client{Timeout: 60 * time.Second},
 	}
+}
+
+// do sends one request under this client's identity: the server reads the
+// User-Agent to refuse (426) a client too old for the registration.
+func (c *Client) do(req *http.Request) (*http.Response, error) {
+	req.Header.Set("User-Agent", c.UserAgent)
+	return c.HTTP.Do(req)
 }
 
 func normalizeBaseURL(raw string) string {
@@ -68,6 +100,9 @@ type ExchangeResponse struct {
 	DatabaseID   string `json:"database_id,omitempty"`
 	DatabaseName string `json:"database_name,omitempty"`
 	Dialect      string `json:"dialect,omitempty"`
+	// TargetGeneration counts the changes of the registration's target
+	// database; a pairing stores it (config.Config.TargetGeneration).
+	TargetGeneration int `json:"target_generation,omitempty"`
 }
 
 // Exchange swaps the refresh token for a short-lived access token.
@@ -78,7 +113,7 @@ func (c *Client) Exchange(ctx context.Context, refreshToken string) (*ExchangeRe
 	if err != nil {
 		return nil, err
 	}
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.do(req)
 	if err != nil {
 		return nil, fmt.Errorf("exchange: %w", err)
 	}
@@ -86,6 +121,9 @@ func (c *Client) Exchange(ctx context.Context, refreshToken string) (*ExchangeRe
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode == http.StatusUpgradeRequired {
+			return nil, upgradeRequired(body)
+		}
 		return nil, fmt.Errorf("exchange: server returned %d: %s",
 			resp.StatusCode, strings.TrimSpace(string(body)))
 	}
@@ -105,7 +143,7 @@ func (c *Client) FetchSnapshot(ctx context.Context, accessToken string) (string,
 		return "", 0, err
 	}
 	req.Header.Set("Authorization", "Bearer "+accessToken)
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.do(req)
 	if err != nil {
 		return "", 0, fmt.Errorf("snapshot: %w", err)
 	}
@@ -113,8 +151,13 @@ func (c *Client) FetchSnapshot(ctx context.Context, accessToken string) (string,
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		if resp.StatusCode == http.StatusConflict && bytes.Contains(body, []byte("publish_required")) {
-			return "", 0, fmt.Errorf("snapshot: %w", ErrPublishRequired)
+		if resp.StatusCode == http.StatusConflict {
+			if bytes.Contains(body, []byte("publish_required")) {
+				return "", 0, fmt.Errorf("snapshot: %w", ErrPublishRequired)
+			}
+			if limits, ok := targetLimits(body); ok {
+				return "", 0, fmt.Errorf("snapshot: %w", limits)
+			}
 		}
 		return "", 0, fmt.Errorf("snapshot: server returned %d: %s",
 			resp.StatusCode, strings.TrimSpace(string(body)))
@@ -125,6 +168,83 @@ func (c *Client) FetchSnapshot(ctx context.Context, accessToken string) (string,
 	}
 	cursor, _ := strconv.ParseInt(resp.Header.Get("X-EE-Next-Cursor"), 10, 64)
 	return string(sqlText), cursor, nil
+}
+
+// ErrTargetLimits is the snapshot refused because the entity layer holds
+// values the target database type cannot store. No snapshot exists until
+// those values are shortened or the schema changes on the server, so the
+// caller keeps retrying: Error() is the one sentence a retry line can carry,
+// Items the values, one line each, to show once.
+type ErrTargetLimits struct {
+	Total int
+	Items string
+}
+
+func (e ErrTargetLimits) Error() string {
+	return fmt.Sprintf("the target database cannot hold %d value(s) of the entity layer — "+
+		"shorten them or change the schema; the sync resumes by itself", e.Total)
+}
+
+// targetLimits reads the snapshot 409 {"detail": {"code":
+// "values_exceed_target_limits", "total": n, "items": [{"entity_type",
+// "table", "column", "reason"}]}}; false for any other body.
+func targetLimits(body []byte) (ErrTargetLimits, bool) {
+	var parsed struct {
+		Detail struct {
+			Code  string `json:"code"`
+			Total int    `json:"total"`
+			Items []struct {
+				EntityType string `json:"entity_type"`
+				Table      string `json:"table"`
+				Column     string `json:"column"`
+				Reason     string `json:"reason"`
+			} `json:"items"`
+		} `json:"detail"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil || parsed.Detail.Code != "values_exceed_target_limits" {
+		return ErrTargetLimits{}, false
+	}
+	lines := make([]string, 0, len(parsed.Detail.Items)+1)
+	for _, item := range parsed.Detail.Items {
+		lines = append(lines, fmt.Sprintf("  %s: %s.%s %s", item.EntityType, item.Table, item.Column, item.Reason))
+	}
+	if more := parsed.Detail.Total - len(parsed.Detail.Items); more > 0 {
+		lines = append(lines, fmt.Sprintf("  … and %d more", more))
+	}
+	return ErrTargetLimits{Total: parsed.Detail.Total, Items: strings.Join(lines, "\n")}, true
+}
+
+// maxApplyErrorChars is the server's limit on a reported message.
+const maxApplyErrorChars = 8000
+
+// ReportApplyError tells the server that the snapshot failed to apply, so the
+// Sync client card shows what the database answered. It is a plain request,
+// not the WebSocket's apply_error frame: no socket is open during a first
+// bootstrap. A message over the server's limit is cut rather than refused.
+func (c *Client) ReportApplyError(ctx context.Context, accessToken, message string) error {
+	if utf8.RuneCountInString(message) > maxApplyErrorChars {
+		message = string([]rune(message)[:maxApplyErrorChars])
+	}
+	body, _ := json.Marshal(map[string]string{"message": message})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		c.BaseURL+"/api/database-sync/apply-error", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	resp, err := c.do(req)
+	if err != nil {
+		return fmt.Errorf("apply-error: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNoContent {
+		raw, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("apply-error: server returned %d: %s",
+			resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+	return nil
 }
 
 // === Device-code (RFC 8628-style) pairing ==================================
@@ -139,12 +259,13 @@ type DeviceCodeResponse struct {
 }
 
 type DeviceCodePollResponse struct {
-	Status       string `json:"status"`
-	RefreshToken string `json:"refresh_token,omitempty"`
-	ServerURL    string `json:"server_url,omitempty"`
-	DatabaseID   string `json:"database_id,omitempty"`
-	DatabaseName string `json:"database_name,omitempty"`
-	Dialect      string `json:"dialect,omitempty"`
+	Status           string `json:"status"`
+	RefreshToken     string `json:"refresh_token,omitempty"`
+	ServerURL        string `json:"server_url,omitempty"`
+	DatabaseID       string `json:"database_id,omitempty"`
+	DatabaseName     string `json:"database_name,omitempty"`
+	Dialect          string `json:"dialect,omitempty"`
+	TargetGeneration int    `json:"target_generation,omitempty"`
 }
 
 // StartDeviceCode initiates a device-code pairing.
@@ -156,7 +277,7 @@ func (c *Client) StartDeviceCode(ctx context.Context, labelHint string) (*Device
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.do(req)
 	if err != nil {
 		return nil, fmt.Errorf("device-code: %w", err)
 	}
@@ -183,7 +304,7 @@ func (c *Client) PollDeviceCode(ctx context.Context, deviceCode string) (*Device
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.do(req)
 	if err != nil {
 		return nil, fmt.Errorf("poll: %w", err)
 	}

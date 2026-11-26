@@ -29,7 +29,7 @@ func (c *Client) HostExchange(ctx context.Context, refreshToken string) (*HostEx
 	if err != nil {
 		return nil, err
 	}
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.do(req)
 	if err != nil {
 		return nil, fmt.Errorf("host-exchange: %w", err)
 	}
@@ -67,6 +67,10 @@ type ClaimResponse struct {
 	DatabaseName          string `json:"database_name"`
 	Dialect               string `json:"dialect"`
 	SuggestedDatabaseName string `json:"suggested_database_name"`
+	// TargetGeneration counts the changes of the registration's target
+	// database. The suggested name carries it, so each target is a database
+	// of its own on the host's server.
+	TargetGeneration int `json:"target_generation"`
 }
 
 // ErrNotClaimable marks the claim 409: another client holds the database's
@@ -86,7 +90,7 @@ func (c *Client) Claim(ctx context.Context, accessToken, databaseID string) (*Cl
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+accessToken)
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.do(req)
 	if err != nil {
 		return nil, fmt.Errorf("claim: %w", err)
 	}
@@ -94,8 +98,11 @@ func (c *Client) Claim(ctx context.Context, accessToken, databaseID string) (*Cl
 
 	if resp.StatusCode != http.StatusOK {
 		raw, _ := io.ReadAll(resp.Body)
-		if resp.StatusCode == http.StatusConflict {
+		switch resp.StatusCode {
+		case http.StatusConflict:
 			return nil, ErrNotClaimable{Body: strings.TrimSpace(string(raw))}
+		case http.StatusUpgradeRequired:
+			return nil, upgradeRequired(raw)
 		}
 		return nil, fmt.Errorf("claim: server returned %d: %s",
 			resp.StatusCode, strings.TrimSpace(string(raw)))

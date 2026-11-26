@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -32,6 +33,7 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/mattn/go-isatty"
+	"golang.org/x/term"
 
 	"github.com/TOT-Concept/ee-database/internal/apply"
 	"github.com/TOT-Concept/ee-database/internal/auth"
@@ -96,8 +98,9 @@ Usage:
   ee-database run --all                          Sync every paired database (saved DSNs)
   ee-database host pair --server URL --dsn DSN <token>
                                                  Pair this machine as a managed sync host
-                                                 (one pairing per server; repeatable
-                                                 against several backends)
+                                                 (one pairing and one database type per
+                                                 server; repeatable against several
+                                                 backends)
   ee-database host run [--verbose]               Auto-claim, provision and sync every
                                                  database sync assigned to this host,
                                                  on every paired server (--server URL
@@ -112,19 +115,25 @@ Selection flags (run / status / disconnect):
                      terminal and fail with the list otherwise.
 
 Run flags:
-  --dsn DSN          Target database connection string, e.g.
-                     postgres://user:pass@localhost:5432/mydb
-  --save-dsn         Store the DSN in the profile dir (mode 0600) for later runs
+  --dsn DSN          Target database connection string. Its form follows the
+                     database type of the sync (postgres | sqlserver):
+                       postgres://user:pass@localhost:5432/mydb
+                       sqlserver://user:pass@localhost:1433?database=mydb
+                     With no DSN at all, run asks on a terminal for its
+                     parts (host, port, user, password, database) and
+                     offers to save the DSN they make.
+  --save-dsn         Store the DSN in the profile dir (mode 0600) for later
+                     runs, once the connection succeeds
   --skip-bootstrap   Skip the initial snapshot apply on first run
   --create-missing   Create the target database first when it does not exist.
-                     Uses the DSN's own credentials, which then need
-                     server-level create rights (postgres: CREATEDB via the
-                     'postgres' maintenance database; mysql: CREATE DATABASE
-                     IF NOT EXISTS; sqlite: the file is created anyway).
+                     Uses the DSN's own credentials, which then need the
+                     server-level create right (PostgreSQL: CREATEDB, through
+                     the 'postgres' maintenance database; SQL Server: CREATE
+                     ANY DATABASE, through master).
   --admin-dsn DSN    Optional admin connection for --create-missing: also
-                     creates the target DSN's role/user (with its password)
-                     when missing, and makes it own the new database. The
-                     target DSN then needs no create rights of its own.
+                     creates the target DSN's login (with its password) when
+                     missing, and gives it the new database. The target DSN
+                     then needs no create rights of its own.
   --all              Run every paired database concurrently. Each profile must
                      have a saved DSN (--dsn/--save-dsn are rejected).
   --verbose          Log every delta's write shape (per-table upserts, prunes,
@@ -160,10 +169,16 @@ func listProfilesOrExit(stderr io.Writer) ([]config.Profile, int) {
 
 func describeProfile(p config.Profile) string {
 	dialect := p.Config.Dialect
-	if dialect == "" {
-		dialect = "postgres"
+	if driver, err := apply.For(dialect); err == nil {
+		dialect = driver.Dialect()
 	}
 	return fmt.Sprintf("%s (%s) @ %s", p.Label(), dialect, p.Config.ServerURL)
+}
+
+// newAuthClient builds the REST client for one server, identified as this
+// release on every request.
+func newAuthClient(serverURL string) *auth.Client {
+	return auth.New(serverURL, eesync.Agent)
 }
 
 // matchProfile resolves a --database value: exact id first, then
@@ -222,16 +237,192 @@ func promptProfile(profiles []config.Profile, stdout io.Writer) (config.Profile,
 	for i, p := range profiles {
 		fmt.Fprintf(stdout, "  %d) %s\n", i+1, describeProfile(p))
 	}
-	fmt.Fprintf(stdout, "Select a database [1-%d]: ", len(profiles))
-	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	line, err := promptLine(stdout, fmt.Sprintf("Select a database [1-%d]: ", len(profiles)))
 	if err != nil {
 		return config.Profile{}, fmt.Errorf("read selection: %w", err)
 	}
-	n, err := strconv.Atoi(strings.TrimSpace(line))
+	n, err := strconv.Atoi(line)
 	if err != nil || n < 1 || n > len(profiles) {
-		return config.Profile{}, fmt.Errorf("invalid selection %q", strings.TrimSpace(line))
+		return config.Profile{}, fmt.Errorf("invalid selection %q", line)
 	}
 	return profiles[n-1], nil
+}
+
+// stdinLines is the one reader of the terminal, so that answers typed ahead
+// of a later prompt are not lost in a discarded buffer.
+var stdinLines = bufio.NewReader(os.Stdin)
+
+func promptLine(stdout io.Writer, prompt string) (string, error) {
+	fmt.Fprint(stdout, prompt)
+	line, err := stdinLines.ReadString('\n')
+	if err != nil && line == "" {
+		return "", err
+	}
+	return strings.TrimSpace(line), nil
+}
+
+// exampleDSN is the target DSN form of a database type, for messages.
+func exampleDSN(driver apply.Driver) string {
+	return driver.ComposeDSN(apply.DSNParts{
+		Host: "localhost", Port: driver.DefaultPort(), User: "user", Password: "password", Database: "mydb",
+	})
+}
+
+// promptField asks for one connection parameter; Enter keeps def, and a
+// parameter without default must be given.
+func promptField(stdout io.Writer, label, def string) (string, error) {
+	prompt := "  " + label + ": "
+	if def != "" {
+		prompt = fmt.Sprintf("  %s [%s]: ", label, def)
+	}
+	for {
+		v, err := promptLine(stdout, prompt)
+		if err != nil {
+			return "", fmt.Errorf("read %s: %w", strings.ToLower(label), err)
+		}
+		if v == "" {
+			v = def
+		}
+		if v != "" {
+			return v, nil
+		}
+	}
+}
+
+// readPassword reads a line without echo. Ctrl-C while it waits restores the
+// terminal's echo before quitting.
+func readPassword(stdout io.Writer, prompt string) (string, error) {
+	fd := int(os.Stdin.Fd())
+	state, err := term.GetState(fd)
+	if err != nil {
+		return "", err
+	}
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+	defer func() { signal.Stop(sig); close(sig) }()
+	go func() {
+		if _, ok := <-sig; ok {
+			_ = term.Restore(fd, state)
+			fmt.Fprintln(stdout)
+			os.Exit(130)
+		}
+	}()
+	fmt.Fprint(stdout, prompt)
+	password, err := term.ReadPassword(fd)
+	fmt.Fprintln(stdout)
+	return string(password), err
+}
+
+// promptParts asks for the connection parameters a failed connection points
+// at — all of them first, and when the failure names none. Each prompt
+// offers the last value, so Enter keeps it.
+func promptParts(parts *apply.DSNParts, problem apply.ConnectProblem, stdout io.Writer) error {
+	all := problem == apply.ProblemUnknown
+	var err error
+	if all || problem == apply.ProblemEndpoint {
+		if parts.Host, err = promptField(stdout, "Host", parts.Host); err != nil {
+			return err
+		}
+		for {
+			port, err := promptField(stdout, "Port", strconv.Itoa(parts.Port))
+			if err != nil {
+				return err
+			}
+			if n, err := strconv.Atoi(port); err == nil && n > 0 && n < 65536 {
+				parts.Port = n
+				break
+			}
+			fmt.Fprintf(stdout, "  %q is not a port number.\n", port)
+		}
+	}
+	if all || problem == apply.ProblemLogin {
+		if parts.User, err = promptField(stdout, "User", parts.User); err != nil {
+			return err
+		}
+		prompt := "  Password: "
+		if parts.Password != "" {
+			prompt = "  Password [unchanged]: "
+		}
+		password, err := readPassword(stdout, prompt)
+		if err != nil {
+			return fmt.Errorf("read password: %w", err)
+		}
+		if password != "" {
+			parts.Password = password
+		}
+	}
+	if all || problem == apply.ProblemDatabase {
+		if parts.Database, err = promptField(stdout, "Database", parts.Database); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// promptConnect asks for the connection parameters of a target run without a
+// DSN until they connect, asking again only for the ones a failure points at,
+// then offers to keep the DSN they make.
+func promptConnect(t *target, createMissing bool, adminDSN string, stdout io.Writer) (*sql.DB, error) {
+	fmt.Fprintf(stdout, "No DSN for %s. Enter the connection parameters of the %s database to sync\n",
+		targetLabel(t), t.driver.Label())
+	fmt.Fprintln(stdout, "(Enter keeps the value in brackets, Ctrl-C quits):")
+	parts := apply.DSNParts{Host: "localhost", Port: t.driver.DefaultPort(), Database: t.cfg.DatabaseName}
+	problem := apply.ProblemUnknown
+	for {
+		if err := promptParts(&parts, problem, stdout); err != nil {
+			return nil, err
+		}
+		t.dsn = t.driver.ComposeDSN(parts)
+		if u, err := url.Parse(t.dsn); err == nil {
+			fmt.Fprintf(stdout, "Connecting to %s …\n", u.Redacted())
+		}
+		db, p, err := connectTarget(context.Background(), t, createMissing, adminDSN, stdout)
+		if err == nil {
+			fmt.Fprintln(stdout, "✓ Connected.")
+			if !t.saveDSN {
+				answer, err := promptLine(stdout, "Save this DSN for later runs? [Y/n]: ")
+				if err != nil {
+					db.Close()
+					return nil, fmt.Errorf("read answer: %w", err)
+				}
+				t.saveDSN = answer == "" || strings.HasPrefix(strings.ToLower(answer), "y")
+			}
+			return db, nil
+		}
+		fmt.Fprintf(stdout, "✗ %v\n", err)
+		problem = p
+	}
+}
+
+// connectTarget opens the target (creating it first with --create-missing)
+// and pings it. A failure is explained in words and reports the connection
+// parameter it points at.
+func connectTarget(ctx context.Context, t *target, createMissing bool, adminDSN string, stdout io.Writer) (*sql.DB, apply.ConnectProblem, error) {
+	if createMissing {
+		ensured, err := t.driver.EnsureDatabase(ctx, t.dsn, adminDSN)
+		if err != nil {
+			problem, why := apply.DiagnoseConnect(t.driver, err)
+			return nil, problem, fmt.Errorf("create-missing: %s", why)
+		}
+		if ensured.LoginCreated {
+			fmt.Fprintf(stdout, "✓ Created login for %s\n", targetLabel(t))
+		}
+		if ensured.DatabaseCreated {
+			fmt.Fprintf(stdout, "✓ Created database %s for %s\n", ensured.Name, targetLabel(t))
+		}
+	}
+	db, err := t.driver.Open(t.dsn)
+	if err != nil {
+		return nil, apply.ProblemUnknown, err
+	}
+	pingCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	if err := db.PingContext(pingCtx); err != nil {
+		db.Close()
+		problem, why := apply.DiagnoseConnect(t.driver, err)
+		return nil, problem, fmt.Errorf("cannot connect to the target database: %s", why)
+	}
+	return db, apply.ProblemUnknown, nil
 }
 
 // === pair ====================================================================
@@ -248,7 +439,7 @@ func cmdPair(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "pair: --server is required (e.g. --server https://entityenricher.ai)")
 		return 2
 	}
-	c := auth.New(serverURL)
+	c := newAuthClient(serverURL)
 	if fs.NArg() == 0 {
 		return runDeviceCodePair(c, stdout, stderr)
 	}
@@ -266,13 +457,19 @@ func runManualPair(c *auth.Client, refreshToken string, stdout, stderr io.Writer
 	// belongs to (older servers omit the metadata → the profile self-heals
 	// on the first run).
 	resp, err := c.Exchange(ctx, refreshToken)
+	var upgrade auth.ErrUpgradeRequired
+	if errors.As(err, &upgrade) {
+		// The token is fine; this release is too old for the database sync.
+		fmt.Fprintf(stderr, "pair: %v\n", err)
+		return 1
+	}
 	if err != nil {
 		fmt.Fprintf(stderr, "pair: failed to validate refresh token: %v\n", err)
 		return 1
 	}
 	return persistPairing(
 		c, refreshToken, resp.DatabaseID, resp.DatabaseName, resp.Dialect,
-		stdout, stderr,
+		resp.TargetGeneration, stdout, stderr,
 	)
 }
 
@@ -324,7 +521,7 @@ func runDeviceCodePair(c *auth.Client, stdout, stderr io.Writer) int {
 			fmt.Fprintln(stdout, "✓ Confirmed.")
 			return persistPairing(
 				c, resp.RefreshToken, resp.DatabaseID, resp.DatabaseName, resp.Dialect,
-				stdout, stderr,
+				resp.TargetGeneration, stdout, stderr,
 			)
 		case "cancelled":
 			fmt.Fprintln(stderr, "pair: the user cancelled the pairing in the browser.")
@@ -342,19 +539,49 @@ func runDeviceCodePair(c *auth.Client, stdout, stderr io.Writer) int {
 	}
 }
 
+// targetChanged reports whether the server changed the registration's target
+// database since the profile was paired or claimed: the profile's saved DSN
+// then names the previous target, which must not receive the new one's feed.
+func targetChanged(cfg config.Config, serverGeneration int) bool {
+	return cfg.TargetGeneration != serverGeneration
+}
+
+// dialectLabel names a database type for the operator ("PostgreSQL", "SQL
+// Server"); a dialect this release does not know is shown as the server
+// spells it.
+func dialectLabel(dialect string) string {
+	driver, err := apply.For(dialect)
+	if err != nil {
+		return dialect
+	}
+	return driver.Label()
+}
+
 func persistPairing(
 	c *auth.Client, refreshToken, databaseID, databaseName, dialect string,
-	stdout, stderr io.Writer,
+	targetGeneration int, stdout, stderr io.Writer,
 ) int {
 	cfg := &config.Config{
-		DatabaseID:   databaseID,
-		DatabaseName: databaseName,
-		Dialect:      dialect,
-		ServerURL:    c.BaseURL,
+		DatabaseID:       databaseID,
+		DatabaseName:     databaseName,
+		Dialect:          dialect,
+		ServerURL:        c.BaseURL,
+		TargetGeneration: targetGeneration,
 	}
 	key := databaseID
 	if key == "" {
 		key = config.LegacyKey
+	}
+	// Pairing again rotates the credential and keeps the saved DSN — unless
+	// the target database itself changed in between: the DSN then names the
+	// previous one.
+	retargeted, hadDSN := false, false
+	if prev, _, err := config.LoadProfile(key); err == nil && targetChanged(*prev, targetGeneration) {
+		retargeted, hadDSN = true, config.LoadProfileDSN(key) != ""
+		if err := config.ClearProfileDSN(key); err != nil {
+			fmt.Fprintf(stderr, "pair: %v\n", err)
+			return 1
+		}
 	}
 	if err := config.SaveProfile(key, cfg, refreshToken); err != nil {
 		fmt.Fprintf(stderr, "pair: save: %v\n", err)
@@ -364,6 +591,14 @@ func persistPairing(
 	fmt.Fprintf(stdout, "✓ Paired with %s\n", c.BaseURL)
 	if databaseName != "" {
 		fmt.Fprintf(stdout, "  Database: %s (%s)\n", databaseName, dialect)
+	}
+	if retargeted {
+		next := "Pass the new database's --dsn on the next run."
+		if hadDSN {
+			next = "The saved DSN was discarded: pass --dsn on the next run."
+		}
+		fmt.Fprintf(stdout, "  The target database of %q changed (now %s). %s\n",
+			databaseName, dialectLabel(dialect), next)
 	}
 	fmt.Fprintf(stdout, "  Credentials stored in %s\n", dir)
 	runHint := "ee-database run --dsn <your-dsn>"
@@ -446,16 +681,39 @@ func cmdDisconnect(args []string, stdout, stderr io.Writer) int {
 // target is one profile scheduled for syncing. key mutates when a legacy
 // profile self-heals to its real database id.
 type target struct {
-	key       string
-	cfg       *config.Config
-	refresh   string
-	dsn       string
+	key     string
+	cfg     *config.Config
+	refresh string
+	dsn     string
+	// driver is the registration's database type, resolved once when the
+	// target is built: everything this run opens and applies goes through it.
+	driver    apply.Driver
 	preflight framing.PreflightReport
 	// trigram is lazily built from the preflight on first connect and shared
 	// across reconnects, so the missing-pg_trgm advisory fires once per run.
 	trigram *eesync.TrigramAdvisor
+	// limitsShown is the list of values the last refused snapshot named, so
+	// the retries of the same refusal do not print it again.
+	limitsShown string
 	// verbose adds the per-delta write shape and timing to this target's log.
 	verbose bool
+	// saveDSN stores dsn in the profile once the target answers, so a DSN
+	// that does not connect is never kept.
+	saveDSN bool
+	// askDSN: no DSN was given or saved, so the run asks for its parameters.
+	askDSN bool
+}
+
+// newTarget resolves the profile's dialect to its driver; a dialect this
+// release cannot serve stops here, before anything is opened.
+func newTarget(key string, cfg *config.Config, refresh, dsn string, verbose bool) (*target, error) {
+	driver, err := apply.For(cfg.Dialect)
+	if err != nil {
+		return nil, err
+	}
+	return &target{
+		key: key, cfg: cfg, refresh: refresh, dsn: dsn, driver: driver, verbose: verbose,
+	}, nil
 }
 
 // cmdRun runs the apply loop(s) until interrupted.
@@ -466,7 +724,7 @@ func cmdRun(args []string, stdout, stderr io.Writer, logger *log.Logger) int {
 	saveDSN := fs.Bool("save-dsn", false, "Store the DSN (mode 0600) for later runs")
 	skipBootstrap := fs.Bool("skip-bootstrap", false, "Skip the initial snapshot apply")
 	createMissing := fs.Bool("create-missing", false, "Create the target database when it does not exist")
-	adminDSN := fs.String("admin-dsn", "", "Admin connection used by --create-missing to bootstrap the target role and database")
+	adminDSN := fs.String("admin-dsn", "", "Admin connection used by --create-missing to bootstrap the target login and database")
 	database := fs.String("database", "", "Pairing to run (name or id)")
 	all := fs.Bool("all", false, "Run every paired database concurrently")
 	verbose := fs.Bool("verbose", false, "Log each delta's write shape and timing")
@@ -506,9 +764,12 @@ func cmdRun(args []string, stdout, stderr io.Writer, logger *log.Logger) int {
 				fmt.Fprintf(stderr, "run: %s: %v\n", p.Label(), err)
 				return 1
 			}
-			targets = append(targets, &target{
-				key: p.Key, cfg: p.Config, refresh: refresh, dsn: dsn, verbose: *verbose,
-			})
+			t, err := newTarget(p.Key, p.Config, refresh, dsn, *verbose)
+			if err != nil {
+				fmt.Fprintf(stderr, "run: %s: %v\n", p.Label(), err)
+				return 1
+			}
+			targets = append(targets, t)
 		}
 		if len(missing) > 0 {
 			fmt.Fprintf(stderr, "run: no saved DSN for: %s\n", strings.Join(missing, ", "))
@@ -533,69 +794,83 @@ func cmdRun(args []string, stdout, stderr io.Writer, logger *log.Logger) int {
 		if dsn == "" {
 			dsn = config.LoadProfileDSN(p.Key)
 		}
-		if dsn == "" {
-			fmt.Fprintln(stderr, "run: no DSN. Pass --dsn, set EE_DATABASE_DSN, or use --save-dsn once.")
-			return 2
+		t, err := newTarget(p.Key, p.Config, refresh, dsn, *verbose)
+		if err != nil {
+			fmt.Fprintf(stderr, "run: %s: %v\n", p.Label(), err)
+			return 1
 		}
-		if *saveDSN {
-			if err := config.SaveProfileDSN(p.Key, dsn); err != nil {
-				fmt.Fprintf(stderr, "run: save dsn: %v\n", err)
-				return 1
+		t.saveDSN = *saveDSN
+		if t.dsn == "" {
+			if !stdinIsTTY() {
+				fmt.Fprintf(stderr, "run: no DSN for %s. Pass --dsn (with --save-dsn to keep it) or set EE_DATABASE_DSN.\n", p.Label())
+				fmt.Fprintf(stderr, "  Example: %s\n", exampleDSN(t.driver))
+				return 2
 			}
+			t.askDSN = true
 		}
-		targets = append(targets, &target{
-			key: p.Key, cfg: p.Config, refresh: refresh, dsn: dsn, verbose: *verbose,
-		})
+		targets = append(targets, t)
 	}
 
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer cancel()
-
-	// Lock, open and ping every target before starting any loop — a fully
-	// misconfigured target should fail the command, not die quietly later.
-	dbs := make([]*sql.DB, len(targets))
-	for i, t := range targets {
+	// Lock every target first, so a sync another process already runs is
+	// refused before anything is asked.
+	for _, t := range targets {
 		unlock, err := config.LockProfile(t.key)
 		if err != nil {
 			fmt.Fprintf(stderr, "run: %s: %v\n", targetLabel(t), err)
 			return 1
 		}
 		defer unlock()
+	}
 
-		if *skipBootstrap && !t.cfg.Bootstrapped {
-			t.cfg.Bootstrapped = true
-			_ = config.SaveProfileConfig(t.key, t.cfg)
+	// A target without DSN is asked for its parameters before signals are
+	// caught, so Ctrl-C still quits the prompt.
+	dbs := make([]*sql.DB, len(targets))
+	for i, t := range targets {
+		if !t.askDSN {
+			continue
 		}
-		if *createMissing {
-			ensured, err := apply.EnsureDatabase(ctx, t.cfg.Dialect, t.dsn, *adminDSN)
-			if err != nil {
-				fmt.Fprintf(stderr, "run: %s: create-missing: %v\n", targetLabel(t), err)
-				return 1
-			}
-			if ensured.RoleCreated {
-				fmt.Fprintf(stdout, "✓ Created role for %s\n", targetLabel(t))
-			}
-			if ensured.DatabaseCreated {
-				fmt.Fprintf(stdout, "✓ Created database %s for %s\n", ensured.Name, targetLabel(t))
-			}
-		}
-		db, err := apply.Open(t.cfg.Dialect, t.dsn)
+		db, err := promptConnect(t, *createMissing, *adminDSN, stdout)
 		if err != nil {
 			fmt.Fprintf(stderr, "run: %s: %v\n", targetLabel(t), err)
 			return 1
 		}
 		defer db.Close()
-		if err := db.PingContext(ctx); err != nil {
-			fmt.Fprintf(stderr, "run: %s: cannot reach the target database: %v\n", targetLabel(t), err)
-			return 1
+		dbs[i] = db
+	}
+
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
+	// Open and ping every target before starting any loop — a fully
+	// misconfigured target should fail the command, not die quietly later.
+	for i, t := range targets {
+		if *skipBootstrap && !t.cfg.Bootstrapped {
+			t.cfg.Bootstrapped = true
+			_ = config.SaveProfileConfig(t.key, t.cfg)
+		}
+		if dbs[i] == nil {
+			db, _, err := connectTarget(ctx, t, *createMissing, *adminDSN, stdout)
+			if err != nil {
+				fmt.Fprintf(stderr, "run: %s: %v\n", targetLabel(t), err)
+				return 1
+			}
+			defer db.Close()
+			dbs[i] = db
+		}
+		db := dbs[i]
+		if t.saveDSN {
+			if err := config.SaveProfileDSN(t.key, t.dsn); err != nil {
+				fmt.Fprintf(stderr, "run: %s: save dsn: %v\n", targetLabel(t), err)
+				return 1
+			}
+			fmt.Fprintf(stdout, "✓ DSN saved for %s; later runs use it.\n", targetLabel(t))
 		}
 		// Provisioning-rights self-check: printed here, reported to the server
 		// on every connect so the Sync client card shows gaps before a publish
 		// queues deltas that could never apply. Advisory — a missing right
 		// doesn't stop the run; the apply path still surfaces real failures.
-		t.preflight = apply.Preflight(ctx, t.cfg.Dialect, t.dsn, db)
-		fmt.Fprintf(stdout, "Preflight %s: %s\n", targetLabel(t), preflightSummary(t.preflight))
-		dbs[i] = db
+		t.preflight = t.driver.Preflight(ctx, t.dsn, db)
+		fmt.Fprintf(stdout, "Preflight %s: %s\n", targetLabel(t), preflightSummary(t.preflight, true))
 	}
 
 	var wg sync.WaitGroup
@@ -653,7 +928,7 @@ func runForever(
 	db *sql.DB,
 	logger *log.Logger,
 ) error {
-	authClient := auth.New(t.cfg.ServerURL)
+	authClient := newAuthClient(t.cfg.ServerURL)
 	backoff := newBackoff()
 
 	for {
@@ -698,6 +973,11 @@ func connectAndPump(
 	defer cancel()
 	access, err := authClient.Exchange(exchangeCtx, t.refresh)
 	if err != nil {
+		var upgrade auth.ErrUpgradeRequired
+		if errors.As(err, &upgrade) {
+			// Retrying cannot help: only a newer release can serve this sync.
+			return false, eesync.PermanentError{Inner: err}
+		}
 		if strings.Contains(err.Error(), "401") {
 			return false, eesync.PermanentError{Inner: fmt.Errorf(
 				"%w — run 'ee-database pair' again: %v", errCredentialRevoked, err)}
@@ -712,6 +992,7 @@ func connectAndPump(
 		}
 	}
 	opts := eesync.Options{
+		Driver:   t.driver,
 		Trigram:  t.trigram,
 		FailDump: failedSnapshotPath(t.key),
 		Verbose:  t.verbose,
@@ -724,6 +1005,7 @@ func connectAndPump(
 	bootstrap := func(rctx context.Context) error {
 		if err := eesync.Bootstrap(rctx, authClient, access.AccessToken, db, logger,
 			opts); err != nil {
+			t.showTargetLimits(err, logger)
 			return err
 		}
 		if !t.cfg.Bootstrapped {
@@ -768,8 +1050,24 @@ func connectAndPump(
 	return true, eesync.Pump(ctx, conn, db, logger, bootstrap, bootstrapPending, opts)
 }
 
-// preflightSummary renders one report as a run-banner line.
-func preflightSummary(r framing.PreflightReport) string {
+// showTargetLimits lists the values a snapshot was refused for. The refusal
+// lasts until someone shortens them on the server and is retried on every
+// backoff: the list is printed on first sight and when it changes, and the
+// retry line keeps to the error's one sentence.
+func (t *target) showTargetLimits(err error, logger *log.Logger) {
+	var limits auth.ErrTargetLimits
+	if !errors.As(err, &limits) || limits.Items == t.limitsShown {
+		return
+	}
+	t.limitsShown = limits.Items
+	logger.Printf("the snapshot is refused for these values of the entity layer:\n%s", limits.Items)
+}
+
+// preflightSummary renders one report as a run-banner line. A target is checked
+// through a connection to its own database, which therefore exists: creating
+// databases is then a right nobody needs, and lacking it is no gap (the Sync
+// client card words it the same way). A host's whole role is to create them.
+func preflightSummary(r framing.PreflightReport, databaseExists bool) string {
 	part := func(name string, v *bool) string {
 		switch {
 		case v == nil:
@@ -780,11 +1078,16 @@ func preflightSummary(r framing.PreflightReport) string {
 			return name + " MISSING"
 		}
 	}
-	s := fmt.Sprintf("%s, %s, %s",
-		part("CREATEDB", r.CreateDB), part("DDL", r.DDL), part("DML", r.DML))
+	rights := []string{part("DDL", r.DDL), part("DML", r.DML)}
 	if r.Trigram != nil {
-		s += ", " + part("pg_trgm", r.Trigram)
+		rights = append(rights, part("pg_trgm", r.Trigram))
 	}
+	if databaseExists && r.CreateDB != nil && !*r.CreateDB {
+		rights = append(rights, "no create-database right (not needed: the target database exists)")
+	} else {
+		rights = append([]string{part("create database", r.CreateDB)}, rights...)
+	}
+	s := strings.Join(rights, ", ")
 	if len(r.Details) > 0 {
 		s += " — " + strings.Join(r.Details, "; ")
 	}
@@ -807,11 +1110,7 @@ func healProfile(t *target, access *auth.ExchangeResponse, logger *log.Logger) {
 		t.cfg.DatabaseName = access.DatabaseName
 		changed = true
 	}
-	if access.Dialect != "" && t.cfg.Dialect != access.Dialect {
-		if t.cfg.Dialect != "" {
-			logger.Printf("warning: server reports dialect %q but this run opened %q — restart to apply",
-				access.Dialect, t.cfg.Dialect)
-		}
+	if t.cfg.Dialect == "" && access.Dialect != "" {
 		t.cfg.Dialect = access.Dialect
 		changed = true
 	}

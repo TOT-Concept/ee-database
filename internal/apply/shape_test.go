@@ -40,11 +40,6 @@ ON CONFLICT ("a") DO UPDATE SET "b" = EXCLUDED."b" WHERE true`,
 			kind: opUpsert, table: "aircraft_variant",
 		},
 		{
-			name: "mysql upsert",
-			stmt: "INSERT INTO `t` (`a`) VALUES (1) ON DUPLICATE KEY UPDATE `a` = 1",
-			kind: opUpsert, table: "t",
-		},
-		{
 			name: "plain insert",
 			stmt: `INSERT INTO "t" ("a") VALUES (1)`,
 			kind: opInsert, table: "t",
@@ -111,6 +106,42 @@ THEN CREATE INDEX IF NOT EXISTS "ix_t" ON "track" USING gin ("k" gin_trgm_ops); 
 		{
 			name: "no guarded action at all",
 			stmt: `DO $$ BEGIN PERFORM 1; END $$`,
+			kind: opOther, table: "",
+		},
+		{
+			// The NOT NULL block builds its statements at run time (EXECUTE
+			// format(…)), so it names no table — and its ARRAY[…]::text[]
+			// must not be read as a T-SQL bracket name that swallows the rest.
+			name: "guarded not null block names no table",
+			stmt: `DO $ee_mig$
+DECLARE c TEXT; n BIGINT; bad TEXT := '';
+BEGIN
+    IF to_regclass('film') IS NULL THEN RETURN; END IF;
+    FOREACH c IN ARRAY ARRAY['rating', 'year']::text[] LOOP
+        IF EXISTS (SELECT 1 FROM pg_attribute
+                   WHERE attrelid = to_regclass('film')
+                     AND attname = c AND attnum > 0
+                     AND NOT attisdropped AND NOT attnotnull) THEN
+            EXECUTE format('SELECT count(*) FROM %I WHERE %I IS NULL',
+                           'film', c) INTO n;
+            IF n > 0 THEN
+                bad := bad || format('%s (%s row(s)), ', c, n);
+            END IF;
+        END IF;
+    END LOOP;
+    IF bad <> '' THEN
+        RAISE EXCEPTION 'EE-MIGRATE: NULL values in film block NOT NULL on %', left(bad, -2);
+    END IF;
+    FOREACH c IN ARRAY ARRAY['rating', 'year']::text[] LOOP
+        IF EXISTS (SELECT 1 FROM pg_attribute
+                   WHERE attrelid = to_regclass('film')
+                     AND attname = c AND attnum > 0
+                     AND NOT attisdropped AND NOT attnotnull) THEN
+            EXECUTE format('ALTER TABLE %I ALTER COLUMN %I SET NOT NULL',
+                           'film', c);
+        END IF;
+    END LOOP;
+END $ee_mig$`,
 			kind: opOther, table: "",
 		},
 	}

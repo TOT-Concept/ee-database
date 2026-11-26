@@ -18,7 +18,7 @@ type HostHello struct {
 	Version string `json:"version"`
 	Agent   string `json:"agent"`
 	// Dialect of the host's base DSN — feeds the server's assignment
-	// eligibility (a mysql registration never auto-assigns to a postgres host).
+	// eligibility (a registration is only auto-assigned to a host of its dialect).
 	Dialect string `json:"dialect,omitempty"`
 }
 
@@ -32,6 +32,9 @@ type HostRegistration struct {
 	Name         string `json:"name"`
 	Dialect      string `json:"dialect"`
 	DatabaseName string `json:"database_name"` // server-suggested physical name
+	// TargetGeneration counts the changes of the registration's target
+	// database: a local profile claimed at another count is the old target's.
+	TargetGeneration int `json:"target_generation"`
 	// Claimable is false while another client holds the active credential — a
 	// live classic pairing is reported, never evicted.
 	Claimable           bool `json:"claimable"`

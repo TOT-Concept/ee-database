@@ -142,3 +142,41 @@ func TestLockProfileExcludesSecondHolder(t *testing.T) {
 	}
 	unlock2()
 }
+
+// The generation of the target database is part of a pairing; a profile made
+// before the server counted it reads as generation 0, and writes no field.
+func TestTargetGenerationRoundTrip(t *testing.T) {
+	root := tempRoot(t)
+	must(t, SaveProfile("id-4", &Config{DatabaseID: "id-4", ServerURL: "https://x", TargetGeneration: 2}, "tok"))
+	cfg, _, err := LoadProfile("id-4")
+	if err != nil || cfg.TargetGeneration != 2 {
+		t.Fatalf("generation not kept: %+v %v", cfg, err)
+	}
+	must(t, SaveProfile("id-5", &Config{DatabaseID: "id-5", ServerURL: "https://x"}, "tok"))
+	raw, err := os.ReadFile(filepath.Join(root, "profiles", "id-5", "config.json"))
+	must(t, err)
+	var fields map[string]any
+	must(t, json.Unmarshal(raw, &fields))
+	if _, written := fields["target_generation"]; written {
+		t.Fatalf("generation 0 should not be written: %s", raw)
+	}
+}
+
+func TestClearProfileDSNKeepsThePairing(t *testing.T) {
+	tempRoot(t)
+	must(t, SaveProfile("id-6", &Config{DatabaseID: "id-6", ServerURL: "https://x", Bootstrapped: true}, "tok"))
+	must(t, SaveProfileDSN("id-6", "postgres://y"))
+	must(t, ClearProfileDSN("id-6"))
+	if dsn := LoadProfileDSN("id-6"); dsn != "" {
+		t.Fatalf("dsn still saved: %q", dsn)
+	}
+	cfg, token, err := LoadProfile("id-6")
+	if err != nil || token != "tok" || !cfg.Bootstrapped {
+		t.Fatalf("the pairing itself must survive: %+v %q %v", cfg, token, err)
+	}
+	// Nothing saved is nothing to forget.
+	must(t, ClearProfileDSN("id-6"))
+	if err := ClearProfileDSN("../x"); err == nil {
+		t.Fatal("an invalid key must be refused")
+	}
+}

@@ -53,3 +53,37 @@ func TestAckRoundTrip(t *testing.T) {
 		t.Fatalf("got %s, want %s", raw, want)
 	}
 }
+
+// A host reads the registration's database type and the generation of its
+// target: it serves one type, and a profile claimed at another generation
+// belongs to the previous target.
+func TestDecodeHostRegistration(t *testing.T) {
+	raw := []byte(`{"type":"assigned","registrations":[{"database_id":"db-1","name":"Films",` +
+		`"dialect":"sqlserver","database_name":"films__2","target_generation":2,` +
+		`"claimable":true,"has_active_credential":false,"credential_host_id":null}]}`)
+	frame, err := DecodeHost(raw)
+	if err != nil {
+		t.Fatalf("DecodeHost: %v", err)
+	}
+	assigned, ok := frame.(HostAssigned)
+	if !ok || len(assigned.Registrations) != 1 {
+		t.Fatalf("unexpected frame: %#v", frame)
+	}
+	want := HostRegistration{
+		DatabaseID: "db-1", Name: "Films", Dialect: "sqlserver", DatabaseName: "films__2",
+		TargetGeneration: 2, Claimable: true,
+	}
+	if got := assigned.Registrations[0]; got != want {
+		t.Fatalf("registration = %+v, want %+v", got, want)
+	}
+
+	// A server that does not count generations yet sends none: generation 0.
+	frame, err = DecodeHost([]byte(`{"type":"registration_assigned","registration":` +
+		`{"database_id":"db-2","name":"Books","dialect":"postgres","database_name":"books","claimable":true}}`))
+	if err != nil {
+		t.Fatalf("DecodeHost: %v", err)
+	}
+	if reg := frame.(HostRegistrationAssigned).Registration; reg.TargetGeneration != 0 || reg.Dialect != "postgres" {
+		t.Fatalf("registration = %+v", reg)
+	}
+}
